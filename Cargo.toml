@@ -41,6 +41,10 @@ ratatui = "0.29"
 crossterm = "0.28"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 
+# Host-gated: on any other platform this is never fetched or built.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [dev-dependencies]
 tempfile = "3.14"
 assert_cmd = "2"
