@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -46,8 +46,15 @@ pub fn login<S: AuthStorage<StoredAuth>>(store: &GrokTokenStore<S>) -> anyhow::R
     let state = generate_state();
     let auth_url = authorize_url(&discovery, &redirect_uri, &pkce, &state)?;
 
-    println!("Open this URL in your browser to authorize:\n\n  {auth_url}\n");
-    open_browser(&auth_url);
+    // No browser is launched: the URL is printed and opened by hand, in
+    // whichever browser holds the Grok session.
+    println!("Copy this URL into the browser where your Grok session is signed in:\n");
+    println!("  {auth_url}\n");
+    println!("Waiting for authorization...");
+    println!(
+        "If the browser cannot complete the redirect, paste the code (or the full\n\
+         callback URL) here and press Enter.\n"
+    );
     let code = wait_for_callback(&listener, &state, LOGIN_TIMEOUT)?;
     let tokens = exchange_code(&client, &discovery, &code, &pkce, &redirect_uri)?;
     validate_tokens(&tokens)?;
@@ -195,9 +202,19 @@ fn wait_for_callback(
     timeout: Duration,
 ) -> anyhow::Result<String> {
     let deadline = Instant::now() + timeout;
+    let manual = spawn_stdin_reader();
     loop {
         if Instant::now() >= deadline {
             anyhow::bail!("Grok OAuth login timed out");
+        }
+        // A pasted code is the escape hatch for when the loopback redirect
+        // cannot reach us: wrong browser, blocked localhost, closed tab.
+        if let Ok(line) = manual.try_recv() {
+            match manual_code(&line, state) {
+                ManualInput::Code(code) => return Ok(code),
+                ManualInput::Rejected(reason) => eprintln!("{reason}"),
+                ManualInput::Empty => {}
+            }
         }
         match listener.accept() {
             Ok((mut stream, _)) => match callback(&mut stream, state) {
@@ -210,6 +227,58 @@ fn wait_for_callback(
             }
             Err(error) => return Err(error.into()),
         }
+    }
+}
+
+/// Reads pasted input without blocking the callback loop.
+fn spawn_stdin_reader() -> std::sync::mpsc::Receiver<String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { return };
+            if sender.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
+enum ManualInput {
+    Code(String),
+    Rejected(String),
+    Empty,
+}
+
+/// Accepts either the bare authorization code or the whole callback URL. The
+/// URL still has its state verified; a bare code is a deliberate paste, and the
+/// PKCE verifier never leaves this process.
+fn manual_code(input: &str, expected_state: &str) -> ManualInput {
+    let input = input.trim();
+    if input.is_empty() {
+        return ManualInput::Empty;
+    }
+    if !input.starts_with("http://") && !input.starts_with("https://") {
+        return ManualInput::Code(input.to_string());
+    }
+    let Ok(url) = Url::parse(input) else {
+        return ManualInput::Rejected("That does not look like a valid callback URL.".into());
+    };
+    let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    if let Some(error) = params.get("error") {
+        return ManualInput::Rejected(format!("Authorization was denied: {error}"));
+    }
+    if !params
+        .get("state")
+        .is_some_and(|value| constant_time_eq(value, expected_state))
+    {
+        return ManualInput::Rejected(
+            "That callback URL belongs to a different login attempt. Start over.".into(),
+        );
+    }
+    match params.get("code").filter(|code| !code.is_empty()) {
+        Some(code) => ManualInput::Code(code.clone()),
+        None => ManualInput::Rejected("That callback URL has no authorization code.".into()),
     }
 }
 
@@ -280,21 +349,6 @@ fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = stream.write_all(response.as_bytes());
 }
 
-fn open_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let command = ("open", vec![url]);
-    #[cfg(target_os = "linux")]
-    let command = ("xdg-open", vec![url]);
-    #[cfg(target_os = "windows")]
-    let command = ("cmd", vec!["/C", "start", "", url]);
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-    {
-        let _ = std::process::Command::new(command.0)
-            .args(command.1)
-            .spawn();
-    }
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -349,5 +403,59 @@ mod tests {
     fn callback_validates_state_and_path() {
         assert!(constant_time_eq("state", "state"));
         assert!(!constant_time_eq("state", "other"));
+    }
+
+    #[test]
+    fn manual_input_accepts_a_bare_code() {
+        let ManualInput::Code(code) = manual_code("  ABC-123  ", "state") else {
+            panic!("expected a code");
+        };
+        assert_eq!(code, "ABC-123");
+    }
+
+    #[test]
+    fn manual_input_accepts_a_full_callback_url() {
+        let ManualInput::Code(code) = manual_code(
+            "http://127.0.0.1:60653/callback?code=xyz789&state=state",
+            "state",
+        ) else {
+            panic!("expected a code");
+        };
+        assert_eq!(code, "xyz789");
+    }
+
+    #[test]
+    fn manual_input_rejects_a_callback_url_from_another_attempt() {
+        assert!(matches!(
+            manual_code(
+                "http://127.0.0.1:60653/callback?code=xyz&state=stale",
+                "state"
+            ),
+            ManualInput::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn manual_input_surfaces_a_denied_authorization() {
+        let ManualInput::Rejected(reason) = manual_code(
+            "http://127.0.0.1:60653/callback?error=access_denied&state=state",
+            "state",
+        ) else {
+            panic!("expected a rejection");
+        };
+        assert!(reason.contains("access_denied"));
+    }
+
+    #[test]
+    fn manual_input_ignores_blank_lines() {
+        assert!(matches!(manual_code("   ", "state"), ManualInput::Empty));
+    }
+
+    #[test]
+    fn manual_input_rejects_a_url_without_a_code() {
+        assert!(matches!(
+            manual_code("http://127.0.0.1:60653/callback?state=state", "state"),
+            ManualInput::Rejected(_)
+        ));
     }
 }
