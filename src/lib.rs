@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod auth;
 pub mod config;
 pub mod logging;
+pub mod mcp;
 pub mod monitor;
 pub mod paths;
 pub mod project;

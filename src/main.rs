@@ -41,6 +41,12 @@ enum Commands {
     /// Open the monitor TUI with mock data and no proxy server
     #[command(hide = true)]
     Demo,
+    /// Run an MCP server on stdio that exposes Grok as a tool
+    Mcp {
+        /// Port the proxy is listening on. Defaults to the configured port.
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// List supported provider models
     Models {
         #[arg(long)]
@@ -156,6 +162,11 @@ fn main() -> Result<()> {
         Commands::Demo => {
             let registry = Registry::with_default_alias();
             tui::run_mock_monitor(config::port(), &registry)
+        }
+        Commands::Mcp { port } => {
+            // stdout carries protocol frames only; keep log mirroring off it.
+            let _stderr_guard = logging::suppress_stderr();
+            claude_code_proxy::mcp::serve_stdio(port.unwrap_or_else(config::port))
         }
         Commands::Models { full } => {
             print_models(&Registry::with_default_alias(), full);
