@@ -69,7 +69,10 @@ impl GrokClient {
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(120))
+                // Idle timeout, not a total one: a long generation streams for
+                // many minutes and a total timeout would cut it mid-text. This
+                // fires only if the upstream goes quiet for two minutes.
+                .read_timeout(Duration::from_secs(120))
                 .build()?,
         );
         let auth = Arc::new(GrokAuthManager::new(file_store())?);
