@@ -336,36 +336,46 @@ impl Reducer {
                 if !self.calls.is_empty() {
                     anyhow::bail!("function call is incomplete");
                 }
-                let mut out = self.close_active()?;
-                let response = value.get("response").unwrap_or(&value);
-                let usage = response.get("usage").unwrap_or(&Value::Null);
-                let input = usage
-                    .get("input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let output = usage
-                    .get("output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
                 let stop = if self.saw_tool {
                     "tool_use"
                 } else {
                     "end_turn"
                 };
-                self.completed = true;
-                out.push(ReducerEvent::Finish {
-                    stop_reason: stop.into(),
-                    input_tokens: input,
-                    output_tokens: output,
-                    web_search_requests: self.web_search_requests,
-                    x_search_requests: self.x_search_requests,
-                });
-                Ok(out)
+                self.finish(&value, stop)
             }
+            // Emitted when the generation runs into max_output_tokens. It is a
+            // terminal event, not a failure: the text produced so far is valid
+            // and already paid for, so it is returned with `max_tokens` rather
+            // than discarded as an invalid stream.
+            "response.incomplete" => self.finish(&value, "max_tokens"),
             "error" | "response.failed" => anyhow::bail!("upstream Grok stream failed"),
             _ => anyhow::bail!("unsupported Grok stream event: {typ}"),
         }
     }
+    /// Closes any open block and emits the terminal event with the reported
+    /// usage. Shared by the completed and incomplete paths, which differ only
+    /// in the stop reason.
+    fn finish(&mut self, value: &Value, stop_reason: &str) -> anyhow::Result<Vec<ReducerEvent>> {
+        let mut out = self.close_active()?;
+        let response = value.get("response").unwrap_or(value);
+        let usage = response.get("usage").unwrap_or(&Value::Null);
+        self.completed = true;
+        out.push(ReducerEvent::Finish {
+            stop_reason: stop_reason.into(),
+            input_tokens: usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            web_search_requests: self.web_search_requests,
+            x_search_requests: self.x_search_requests,
+        });
+        Ok(out)
+    }
+
     fn delta(&mut self, kind: &str, delta: &str) -> anyhow::Result<Vec<ReducerEvent>> {
         let mut out = Vec::new();
         if self
@@ -433,6 +443,36 @@ pub fn reduce_upstream_bytes(bytes: &[u8]) -> anyhow::Result<Vec<ReducerEvent>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hitting max_output_tokens must return the partial text with a
+    /// `max_tokens` stop reason, not abort the whole stream. The text is
+    /// already generated and already billed.
+    #[test]
+    fn grok_reducer_treats_incomplete_as_a_max_tokens_stop() {
+        let input = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"media escena\"}\n\ndata: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":20}}}\n\n";
+        let events = reduce_upstream_bytes(input).unwrap();
+
+        let finish = events
+            .iter()
+            .find_map(|event| match event {
+                ReducerEvent::Finish {
+                    stop_reason,
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => Some((stop_reason.clone(), *input_tokens, *output_tokens)),
+                _ => None,
+            })
+            .expect("a terminal event");
+        assert_eq!(finish, ("max_tokens".to_string(), 11, 20));
+        assert!(
+            events.iter().any(
+                |event| matches!(event, ReducerEvent::TextDelta(_, text) if text == "media escena")
+            ),
+            "the partial text must survive: {events:?}"
+        );
+    }
+
     #[test]
     fn grok_reducer_handles_text_tool_and_completion() {
         let input = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"call_id\":\"call_1\",\"delta\":\"{}\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n";
