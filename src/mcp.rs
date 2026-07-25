@@ -17,10 +17,44 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 const DEFAULT_MAX_TOKENS: u64 = 16384;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// One completed generation: the text plus what it cost.
+///
+/// The caller needs the accounting to manage spend, and it must not be mixed
+/// into the text, so it travels separately and is emitted as its own content
+/// block.
+#[derive(Debug)]
+pub struct Generation {
+    pub text: String,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub stop_reason: Option<String>,
+}
+
+impl Generation {
+    /// One-line accounting summary, or `None` when the proxy reported nothing.
+    fn usage_line(&self) -> Option<String> {
+        let stop = self.stop_reason.as_deref().unwrap_or("desconocido");
+        match (self.input_tokens, self.output_tokens) {
+            (None, None) => None,
+            (input, output) => Some(format!(
+                "[uso] entrada={} salida={} stop={}{}",
+                input.map_or_else(|| "?".into(), |value| value.to_string()),
+                output.map_or_else(|| "?".into(), |value| value.to_string()),
+                stop,
+                if stop == "max_tokens" {
+                    " — la salida quedo truncada por max_tokens"
+                } else {
+                    ""
+                }
+            )),
+        }
+    }
+}
+
 /// Where `generate` sends its work. Abstracted so the protocol layer can be
 /// tested without a live proxy.
 pub trait Backend {
-    fn generate(&self, args: &Value) -> Result<String, String>;
+    fn generate(&self, args: &Value) -> Result<Generation, String>;
     fn status(&self) -> String;
 }
 
@@ -109,8 +143,12 @@ fn build_request_body(args: &Value, default_model: &str) -> Result<Value, String
     Ok(body)
 }
 
-/// Concatenates the `text` blocks of an Anthropic response.
-fn extract_text(payload: &Value) -> Result<String, String> {
+/// Pulls the `text` blocks and the accounting out of an Anthropic response.
+///
+/// `thinking` blocks are deliberately dropped: they are the model's reasoning,
+/// not its answer. They are still billed, which is why the token counts travel
+/// alongside the text.
+fn extract_generation(payload: &Value) -> Result<Generation, String> {
     let text: String = payload
         .get("content")
         .and_then(Value::as_array)
@@ -124,14 +162,26 @@ fn extract_text(payload: &Value) -> Result<String, String> {
         })
         .unwrap_or_default();
 
+    let stop_reason = payload
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
     if text.is_empty() {
-        let stop = payload
-            .get("stop_reason")
-            .and_then(Value::as_str)
-            .unwrap_or("desconocido");
+        let stop = stop_reason.as_deref().unwrap_or("desconocido");
         return Err(format!("Grok no devolvio texto (stop_reason: {stop})"));
     }
-    Ok(text)
+
+    Ok(Generation {
+        text,
+        input_tokens: payload
+            .pointer("/usage/input_tokens")
+            .and_then(Value::as_u64),
+        output_tokens: payload
+            .pointer("/usage/output_tokens")
+            .and_then(Value::as_u64),
+        stop_reason,
+    })
 }
 
 fn error_message(payload: &Value, status: u16, raw: &str) -> String {
@@ -143,7 +193,7 @@ fn error_message(payload: &Value, status: u16, raw: &str) -> String {
 }
 
 impl Backend for HttpBackend {
-    fn generate(&self, args: &Value) -> Result<String, String> {
+    fn generate(&self, args: &Value) -> Result<Generation, String> {
         let body = build_request_body(args, &crate::config::grok_model())?;
         let response = self
             .client
@@ -167,7 +217,7 @@ impl Backend for HttpBackend {
         if !status.is_success() {
             return Err(error_message(&payload, status.as_u16(), &raw));
         }
-        extract_text(&payload)
+        extract_generation(&payload)
     }
 
     fn status(&self) -> String {
@@ -247,6 +297,16 @@ fn tool_text(text: String, is_error: bool) -> Value {
     json!({"content": [{"type": "text", "text": text}], "isError": is_error})
 }
 
+/// The generated text first, the accounting as a separate block so it never
+/// contaminates the output the caller is after.
+fn tool_generation(generation: &Generation) -> Value {
+    let mut content = vec![json!({"type": "text", "text": generation.text})];
+    if let Some(usage) = generation.usage_line() {
+        content.push(json!({"type": "text", "text": usage}));
+    }
+    json!({"content": content, "isError": false})
+}
+
 /// Handles one request. Returns `None` for notifications, which carry no id and
 /// must not be answered.
 pub fn dispatch(request: &Value, backend: &dyn Backend) -> Option<Value> {
@@ -280,7 +340,7 @@ pub fn dispatch(request: &Value, backend: &dyn Backend) -> Option<Value> {
                 "generate" => Some(result(
                     id,
                     match backend.generate(args) {
-                        Ok(text) => tool_text(text, false),
+                        Ok(generation) => tool_generation(&generation),
                         Err(message) => tool_text(message, true),
                     },
                 )),
@@ -331,8 +391,13 @@ mod tests {
     struct MockBackend;
 
     impl Backend for MockBackend {
-        fn generate(&self, args: &Value) -> Result<String, String> {
-            build_request_body(args, "grok-4.5").map(|body| body.to_string())
+        fn generate(&self, args: &Value) -> Result<Generation, String> {
+            build_request_body(args, "grok-4.5").map(|body| Generation {
+                text: body.to_string(),
+                input_tokens: Some(248),
+                output_tokens: Some(825),
+                stop_reason: Some("end_turn".into()),
+            })
         }
         fn status(&self) -> String {
             "mock".into()
@@ -475,19 +540,75 @@ mod tests {
     }
 
     #[test]
+    fn usage_travels_in_its_own_block_after_the_text() {
+        let response = call("generate", json!({"prompt": "hola"}));
+        let content = response["result"]["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 2);
+        // The text block must stay free of accounting noise.
+        assert!(!content[0]["text"].as_str().unwrap().contains("[uso]"));
+        let usage = content[1]["text"].as_str().unwrap();
+        assert!(usage.contains("entrada=248"), "{usage}");
+        assert!(usage.contains("salida=825"), "{usage}");
+        assert_eq!(response["result"]["isError"], false);
+    }
+
+    #[test]
+    fn a_truncated_generation_says_so_in_the_usage_line() {
+        let generation = Generation {
+            text: "escena a medio".into(),
+            input_tokens: Some(10),
+            output_tokens: Some(4096),
+            stop_reason: Some("max_tokens".into()),
+        };
+        let usage = generation.usage_line().unwrap();
+        assert!(usage.contains("truncada"), "{usage}");
+    }
+
+    #[test]
+    fn usage_block_is_omitted_when_the_proxy_reports_nothing() {
+        let generation = Generation {
+            text: "texto".into(),
+            input_tokens: None,
+            output_tokens: None,
+            stop_reason: None,
+        };
+        assert!(generation.usage_line().is_none());
+        let value = tool_generation(&generation);
+        assert_eq!(value["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn extracts_usage_and_stop_reason_alongside_the_text() {
+        let payload = json!({
+            "content": [{"type": "text", "text": "hola"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 12, "output_tokens": 34}
+        });
+        let generation = extract_generation(&payload).unwrap();
+        assert_eq!(generation.text, "hola");
+        assert_eq!(generation.input_tokens, Some(12));
+        assert_eq!(generation.output_tokens, Some(34));
+        assert_eq!(generation.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
     fn extracts_and_joins_text_blocks_only() {
         let payload = json!({"content": [
             {"type": "thinking", "text": "ignorame"},
             {"type": "text", "text": "Escena 1. "},
             {"type": "text", "text": "Marta entra."}
         ]});
-        assert_eq!(extract_text(&payload).unwrap(), "Escena 1. Marta entra.");
+        assert_eq!(
+            extract_generation(&payload).unwrap().text,
+            "Escena 1. Marta entra."
+        );
     }
 
     #[test]
     fn empty_content_reports_the_stop_reason() {
         let payload = json!({"content": [], "stop_reason": "max_tokens"});
-        let error = extract_text(&payload).expect_err("must fail");
+        let error = extract_generation(&payload).expect_err("must fail");
         assert!(error.contains("max_tokens"));
     }
 
