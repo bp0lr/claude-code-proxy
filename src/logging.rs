@@ -163,6 +163,10 @@ fn set_mode(path: &Path, mode: u32) {
             let _ = fs::set_permissions(path, perm);
         }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
 }
 
 fn now_iso8601() -> String {
@@ -188,7 +192,10 @@ fn redact_with_depth(value: Value, depth: u8) -> Value {
             if config::log_verbose() {
                 Value::String(s)
             } else if s.len() > 4000 {
-                Value::String(format!("{}…[{} more]", &s[..4000], s.len() - 4000))
+                // Truncate on a char boundary: `&s[..4000]` panics when byte
+                // 4000 lands inside a multi-byte character.
+                let end = floor_char_boundary(&s, 4000);
+                Value::String(format!("{}…[{} more]", &s[..end], s.len() - end))
             } else {
                 Value::String(s)
             }
@@ -214,6 +221,18 @@ fn redact_with_depth(value: Value, depth: u8) -> Value {
     }
 }
 
+/// Largest index `<= max` that is a UTF-8 character boundary.
+fn floor_char_boundary(value: &str, max: usize) -> usize {
+    if max >= value.len() {
+        return value.len();
+    }
+    let mut end = max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 fn redact_key_redaction(value: Value) -> Value {
     match value {
         Value::String(s) => Value::String(format!("[redacted len={}]", s.len())),
@@ -231,6 +250,27 @@ mod tests {
     use std::sync::Mutex;
 
     static STDERR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn truncation_never_splits_a_multibyte_character() {
+        // 3999 ASCII bytes + 'ñ' puts byte 4000 inside the two-byte character,
+        // which is exactly where `&s[..4000]` used to panic.
+        let text = format!("{}ñ{}", "a".repeat(3999), "b".repeat(100));
+        let end = floor_char_boundary(&text, 4000);
+        assert_eq!(end, 3999);
+        let _ = &text[..end];
+
+        assert_eq!(floor_char_boundary("hola", 10), 4);
+        assert_eq!(floor_char_boundary("ñ", 1), 0);
+    }
+
+    #[test]
+    fn truncation_keeps_short_strings_intact() {
+        let Value::String(redacted) = redact_value(Value::String("hola ñandú".into())) else {
+            panic!("expected a string");
+        };
+        assert_eq!(redacted, "hola ñandú");
+    }
 
     #[test]
     fn stderr_suppression_disables_level_mirroring() {
