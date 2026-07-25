@@ -37,6 +37,11 @@ pub struct ServerConfig {
     pub monitor: Option<MonitorHandle>,
 }
 
+/// Upper bound for a buffered request body. Large enough for any realistic
+/// Claude Code conversation, small enough that a malformed or hostile local
+/// client cannot exhaust memory.
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     serve_inner(config, std::future::pending::<()>()).await
 }
@@ -211,7 +216,7 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         monitor.request_started(&req_id, session_id.clone(), None, EndpointKind::Responses);
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(error) => {
             let response = openai_error(
@@ -422,7 +427,7 @@ async fn dispatch_request(
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let now = current_millis();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => {
             let response = json_error(
