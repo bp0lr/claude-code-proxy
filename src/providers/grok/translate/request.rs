@@ -19,6 +19,8 @@ pub struct GrokResponsesRequest {
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,41 +113,19 @@ pub fn translate_request(
 ) -> anyhow::Result<GrokResponsesRequest> {
     reject_unknown_top_level(req)?;
     let mut instructions = parse_system(req.extra.get("system"))?;
-    let mut tools = parse_tools(req.extra.get("tools"))?;
+    // Only the tools the client actually asked for are forwarded. Nothing is
+    // injected, and no tool is forced from prompt keywords.
+    let tools = parse_tools(req.extra.get("tools"))?;
     let hosted_web_search = tools
         .as_ref()
         .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "web_search"));
-    let dedicated_x_search = tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "x_search"));
-    let x_search_intent = requests_x_search(req);
-    let force_x_search = dedicated_x_search || x_search_intent;
-    let force_web_search = !force_x_search && hosted_web_search && requests_web_search(req);
-    if force_x_search {
-        tools = Some(vec![GrokTool::hosted("x_search")]);
-    } else if force_web_search {
-        tools = Some(vec![GrokTool::hosted("web_search")]);
-    } else {
-        let tools = tools.get_or_insert_default();
-        if !tools.iter().any(|tool| tool.kind == "x_search") {
-            tools.push(GrokTool::hosted("x_search"));
-        }
-    }
     if hosted_web_search {
         append_guidance(
             &mut instructions,
             "For general web searches, use the hosted web_search tool. Do not use shell commands, HTTP clients, or local tools to search the web.",
         );
     }
-    append_guidance(
-        &mut instructions,
-        "For requests to search X or Twitter, use the hosted x_search tool. XSearch accepts a query and supports allowed_x_handles, excluded_x_handles, from_date, and to_date filters. Do not use Bash, curl, HTTP clients, or general web_search for X searches.",
-    );
-    let tool_choice = if force_x_search || force_web_search {
-        Some(GrokToolChoice::Required("required".into()))
-    } else {
-        parse_tool_choice(req.extra.get("tool_choice"), tools.as_ref())?
-    };
+    let tool_choice = parse_tool_choice(req.extra.get("tool_choice"), tools.as_ref())?;
     let mut call_ids = HashSet::new();
     let mut input = Vec::new();
     for message in &req.messages {
@@ -160,7 +140,21 @@ pub fn translate_request(
         store: false,
         stream: true,
         max_output_tokens: req.max_tokens,
+        temperature: parse_temperature(req.extra.get("temperature"))?,
     })
+}
+
+/// `temperature` was accepted by the request validator but never forwarded,
+/// so callers were silently ignored.
+fn parse_temperature(value: Option<&Value>) -> anyhow::Result<Option<f64>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .filter(|value| (0.0..=2.0).contains(value))
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("temperature must be a number between 0 and 2")),
+    }
 }
 
 fn append_guidance(instructions: &mut Option<String>, guidance: &str) {
@@ -168,60 +162,6 @@ fn append_guidance(instructions: &mut Option<String>, guidance: &str) {
         Some(existing) if !existing.is_empty() => format!("{existing}\n\n{guidance}"),
         _ => guidance.into(),
     });
-}
-
-fn latest_user_text(req: &MessagesRequest) -> Option<String> {
-    let message = req
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")?;
-    match &message.content {
-        Value::String(text) => Some(text.to_ascii_lowercase()),
-        Value::Array(blocks) => Some(
-            blocks
-                .iter()
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_ascii_lowercase(),
-        ),
-        _ => None,
-    }
-}
-
-fn requests_x_search(req: &MessagesRequest) -> bool {
-    let Some(text) = latest_user_text(req) else {
-        return false;
-    };
-    [
-        "search x for",
-        "search on x",
-        "search twitter",
-        "search tweets",
-        "x search",
-        "posts on x",
-        "posts from x",
-        "tweets about",
-        "twitter posts",
-    ]
-    .iter()
-    .any(|phrase| text.contains(phrase))
-}
-
-fn requests_web_search(req: &MessagesRequest) -> bool {
-    let Some(text) = latest_user_text(req) else {
-        return false;
-    };
-    [
-        "search online",
-        "search the web",
-        "web search",
-        "look up online",
-        "look up on the web",
-    ]
-    .iter()
-    .any(|phrase| text.contains(phrase))
 }
 
 fn reject_unknown_top_level(req: &MessagesRequest) -> anyhow::Result<()> {
@@ -653,11 +593,11 @@ mod tests {
                 .unwrap()
                 .contains("use the hosted web_search tool")
         );
-        assert_eq!(translated["tool_choice"], "required");
+        assert!(translated["tool_choice"].is_null());
     }
 
     #[test]
-    fn grok_translation_maps_x_intent_to_required_hosted_x_search() {
+    fn grok_translation_keeps_client_tools_when_the_prompt_mentions_x() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
             "messages":[{"role":"user","content":"Search X for recent posts mentioning claude-code-proxy"}],
@@ -671,10 +611,12 @@ mod tests {
             serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
         assert_eq!(
             translated["tools"],
-            serde_json::json!([{"type":"x_search"}])
+            serde_json::json!([
+                {"type":"function","name":"Bash","description":"Run a command","parameters":{"type":"object"}},
+                {"type":"web_search"}
+            ])
         );
-        assert_eq!(translated["tool_choice"], "required");
-        assert!(!translated.to_string().contains("\"name\":\"Bash\""));
+        assert!(translated["tool_choice"].is_null());
     }
 
     #[test]
@@ -705,7 +647,60 @@ mod tests {
             translated["tools"],
             serde_json::json!([{"type":"x_search"}])
         );
-        assert_eq!(translated["tool_choice"], "required");
+        assert!(translated["tool_choice"].is_null());
+    }
+
+    #[test]
+    fn grok_translation_forwards_temperature() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "max_tokens":100,
+            "messages":[{"role":"user","content":"hola"}],
+            "temperature": 0.8
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["temperature"], 0.8);
+    }
+
+    #[test]
+    fn grok_translation_omits_temperature_when_absent() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"hola"}]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert!(translated.get("temperature").is_none());
+    }
+
+    #[test]
+    fn grok_translation_rejects_out_of_range_temperature() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"hola"}],
+            "temperature": 7
+        }))
+        .unwrap();
+        assert!(translate_request(&request, "grok-4.5".into()).is_err());
+    }
+
+    /// A plain generation request must reach Grok with no tools attached.
+    #[test]
+    fn grok_translation_sends_no_tools_when_the_client_asks_for_none() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "max_tokens":256,
+            "messages":[{"role":"user","content":"Escribi una escena breve."}]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert!(translated["tools"].is_null());
+        assert!(translated["instructions"].is_null());
+        assert!(!translated.to_string().contains("x_search"));
     }
 
     #[test]
