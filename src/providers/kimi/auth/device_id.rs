@@ -51,4 +51,8 @@ fn set_mode(path: &std::path::Path, mode: u32) {
             let _ = fs::set_permissions(path, permissions);
         }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
 }
