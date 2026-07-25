@@ -919,6 +919,9 @@ fn error_message_from_response(response_body: &Value) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
+/// How many error captures are kept before the oldest are dropped.
+const MAX_ERROR_CAPTURES: usize = 200;
+
 fn write_error_capture(req_id: &str, document: &Value) -> Option<PathBuf> {
     let dir = crate::paths::state_dir().join("errors");
     fs::create_dir_all(&dir).ok()?;
@@ -933,7 +936,33 @@ fn write_error_capture(req_id: &str, document: &Value) -> Option<PathBuf> {
     let payload = serde_json::to_vec_pretty(document).ok()?;
     file.write_all(&payload).ok()?;
     file.write_all(b"\n").ok()?;
+    prune_error_captures(&dir);
     Some(path)
+}
+
+/// Error captures used to accumulate without bound, and they carry upstream
+/// response bodies. A fixed ceiling keeps enough history to diagnose without
+/// letting the directory grow forever.
+fn prune_error_captures(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut captures: Vec<_> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+
+    if captures.len() <= MAX_ERROR_CAPTURES {
+        return;
+    }
+    // Names start with a 13-digit millisecond stamp, so sorting by name sorts
+    // by age.
+    captures.sort();
+    let excess = captures.len() - MAX_ERROR_CAPTURES;
+    for stale in captures.into_iter().take(excess) {
+        let _ = fs::remove_file(stale);
+    }
 }
 
 fn sanitize_path_part(raw: &str) -> String {
@@ -1105,4 +1134,58 @@ fn set_mode(path: &Path, mode: u32) {
 #[allow(dead_code)]
 fn _unused(session_state: Option<&SessionState>) {
     let _ = session_state;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_captures_are_capped_at_the_ceiling() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+
+        // Names are `<millis>-<reqId>.json`; oldest first.
+        for index in 0..(MAX_ERROR_CAPTURES + 25) {
+            fs::write(dir.join(format!("17000000{index:05}-req.json")), b"{}").unwrap();
+        }
+        fs::write(dir.join("keep-me.txt"), b"not a capture").unwrap();
+
+        prune_error_captures(dir);
+
+        let remaining: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        assert_eq!(remaining.len(), MAX_ERROR_CAPTURES);
+
+        // The survivors are the newest ones.
+        assert!(
+            remaining
+                .iter()
+                .any(|name| name.starts_with("1700000000224"))
+        );
+        assert!(
+            !remaining
+                .iter()
+                .any(|name| name.starts_with("1700000000000"))
+        );
+        assert!(dir.join("keep-me.txt").exists());
+    }
+
+    #[test]
+    fn pruning_leaves_a_directory_under_the_ceiling_alone() {
+        let temp = tempfile::TempDir::new().unwrap();
+        for index in 0..5 {
+            fs::write(
+                temp.path().join(format!("1700000000{index:03}-req.json")),
+                b"{}",
+            )
+            .unwrap();
+        }
+        prune_error_captures(temp.path());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 5);
+    }
 }

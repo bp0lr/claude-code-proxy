@@ -137,6 +137,9 @@ fn write_log_line(line: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// How many rotated `proxy.<millis>` files survive a rotation.
+const MAX_ROTATED_LOGS: usize = 1;
+
 fn rotate_file(path: &Path) -> io::Result<()> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -144,7 +147,44 @@ fn rotate_file(path: &Path) -> io::Result<()> {
         .as_millis();
     let rotated = path.with_extension(format!("{ts}"));
     fs::rename(path, rotated)?;
+    prune_rotated_logs(path);
     Ok(())
+}
+
+/// Rotated logs used to accumulate forever. Keeping a bounded number of them
+/// caps the log directory at a predictable size.
+fn prune_rotated_logs(path: &Path) {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    let prefix = format!("{}.", stem.to_string_lossy());
+    let mut rotated: Vec<_> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|candidate| candidate != path)
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix(&prefix))
+                // The suffix is a millisecond timestamp, so lexicographic
+                // order over equal-length digits is chronological order.
+                .is_some_and(|suffix| suffix.chars().all(|ch| ch.is_ascii_digit()))
+        })
+        .collect();
+
+    if rotated.len() <= MAX_ROTATED_LOGS {
+        return;
+    }
+    rotated.sort();
+    let excess = rotated.len() - MAX_ROTATED_LOGS;
+    for stale in rotated.into_iter().take(excess) {
+        let _ = fs::remove_file(stale);
+    }
 }
 
 fn create_dir(path: &Path, mode: u32) -> io::Result<()> {
@@ -250,6 +290,38 @@ mod tests {
     use std::sync::Mutex;
 
     static STDERR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn rotation_keeps_only_the_newest_rotated_logs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let active = temp.path().join("proxy.log");
+
+        for stamp in ["1700000000001", "1700000000002", "1700000000003"] {
+            fs::write(temp.path().join(format!("proxy.{stamp}")), b"old").unwrap();
+        }
+        fs::write(&active, b"current").unwrap();
+        // Unrelated files must survive.
+        fs::write(temp.path().join("proxy.log.bak"), b"keep").unwrap();
+        fs::write(temp.path().join("notes.txt"), b"keep").unwrap();
+
+        prune_rotated_logs(&active);
+
+        let mut left: Vec<String> = fs::read_dir(temp.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "notes.txt",
+                "proxy.1700000000003",
+                "proxy.log",
+                "proxy.log.bak"
+            ]
+        );
+    }
 
     #[test]
     fn truncation_never_splits_a_multibyte_character() {
