@@ -76,7 +76,7 @@ impl Provider for GrokProvider {
         &GROK_CLI
     }
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        let requested = body.model.clone().unwrap_or_else(|| "grok-4.5".into());
+        let requested = body.model.clone().unwrap_or_else(crate::config::grok_model);
         let resolved = resolve_model(&requested);
         if let Err(error) = assert_allowed_model(&resolved) {
             return json_error(
@@ -155,7 +155,7 @@ impl Provider for GrokProvider {
         }
     }
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        let requested = body.model.clone().unwrap_or_else(|| "grok-4.5".into());
+        let requested = body.model.clone().unwrap_or_else(crate::config::grok_model);
         let resolved = resolve_model(&requested);
         if let Err(error) = assert_allowed_model(&resolved) {
             return json_error(

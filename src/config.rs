@@ -95,6 +95,8 @@ struct GrokConfig {
     pub base_url: Option<String>,
     #[serde(rename = "clientVersion")]
     pub client_version: Option<String>,
+    /// Model used when a request does not name one.
+    pub model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -301,6 +303,21 @@ pub fn grok_base_url() -> String {
         return url;
     }
     "https://cli-chat-proxy.grok.com/v1".to_string()
+}
+
+/// Default Grok model, used when a request does not name one.
+/// `CCP_GROK_MODEL` wins over `grok.model` in config.json.
+pub fn grok_model() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_GROK_MODEL") {
+        return raw.clone();
+    }
+    if let Some(grok) = read_file_config(&paths::config_dir()).and_then(|f| f.grok)
+        && let Some(model) = grok.model
+    {
+        return model;
+    }
+    "grok-4.5".to_string()
 }
 
 pub fn grok_client_version() -> String {
