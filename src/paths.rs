@@ -20,12 +20,22 @@ impl Default for DirResolverEnv {
     }
 }
 
+/// Accepts both the Rust (`std::env::consts::OS`) and the Node-style platform
+/// names, because callers and tests use different spellings.
+fn is_windows(platform: &str) -> bool {
+    matches!(platform, "win32" | "windows")
+}
+
+fn is_macos(platform: &str) -> bool {
+    matches!(platform, "darwin" | "macos")
+}
+
 pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
     if let Some(override_dir) = deps.env.get("CCP_CONFIG_DIR") {
         return Path::new(override_dir).to_path_buf();
     }
 
-    if deps.platform == "win32" {
+    if is_windows(&deps.platform) {
         let appdata = deps
             .env
             .get("APPDATA")
@@ -34,7 +44,7 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
         return join_with_sep(&appdata, &["claude-code-proxy"], true);
     }
 
-    if deps.platform == "darwin" {
+    if is_macos(&deps.platform) {
         return join_with_sep(&deps.home, &[".config", "claude-code-proxy"], false);
     }
 
@@ -47,7 +57,14 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
 }
 
 pub fn resolve_state_dir(deps: &DirResolverEnv) -> PathBuf {
-    if deps.platform == "win32" {
+    // Un XDG_STATE_HOME explicito gana sobre el default de plataforma, en
+    // cualquier plataforma: es como los tests y el servicio de Homebrew
+    // redirigen el estado a un directorio propio.
+    if let Some(base) = deps.env.get("XDG_STATE_HOME") {
+        return join_with_sep(base, &["claude-code-proxy"], false);
+    }
+
+    if is_windows(&deps.platform) {
         let local = deps
             .env
             .get("LOCALAPPDATA")
@@ -56,11 +73,9 @@ pub fn resolve_state_dir(deps: &DirResolverEnv) -> PathBuf {
         return join_with_sep(&local, &["claude-code-proxy"], true);
     }
 
-    let base = deps.env.get("XDG_STATE_HOME").cloned().unwrap_or_else(|| {
-        join_with_sep(&deps.home, &[".local", "state"], false)
-            .to_string_lossy()
-            .into_owned()
-    });
+    let base = join_with_sep(&deps.home, &[".local", "state"], false)
+        .to_string_lossy()
+        .into_owned();
     join_with_sep(&base, &["claude-code-proxy"], false)
 }
 
@@ -141,4 +156,81 @@ pub fn resolve_state_dir_for_env(
         env: env.clone(),
         home: home.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    /// `std::env::consts::OS` is "windows", not "win32", so the runtime name
+    /// must resolve to the same directories the Node-style name does.
+    #[test]
+    fn rust_and_node_platform_names_agree_on_windows() {
+        let env = env(&[
+            ("APPDATA", "C:\\Users\\dev\\AppData\\Roaming"),
+            ("LOCALAPPDATA", "C:\\Users\\dev\\AppData\\Local"),
+        ]);
+        let home = "C:\\Users\\dev";
+
+        assert_eq!(
+            resolve_config_dir_for_env("windows", home, &env),
+            resolve_config_dir_for_env("win32", home, &env)
+        );
+        assert_eq!(
+            resolve_state_dir_for_env("windows", home, &env),
+            resolve_state_dir_for_env("win32", home, &env)
+        );
+        // Debe caer bajo %APPDATA%, no en el fallback XDG (~/.config), que es
+        // adonde iba antes de aceptar el nombre "windows".
+        let config = resolve_config_dir_for_env("windows", home, &env)
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            config.starts_with("C:\\Users\\dev\\AppData\\Roaming"),
+            "{config}"
+        );
+        assert!(config.ends_with("claude-code-proxy"), "{config}");
+        assert!(!config.contains(".config"), "{config}");
+
+        let state = resolve_state_dir_for_env("windows", home, &env)
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            state.starts_with("C:\\Users\\dev\\AppData\\Local"),
+            "{state}"
+        );
+    }
+
+    /// Redirigir el estado con XDG_STATE_HOME tiene que funcionar tambien en
+    /// Windows: es el mecanismo que usan los tests de integracion.
+    #[test]
+    fn explicit_xdg_state_home_overrides_the_platform_default() {
+        let env = env(&[
+            ("XDG_STATE_HOME", "/tmp/scratch"),
+            ("LOCALAPPDATA", "C:\\Users\\dev\\AppData\\Local"),
+        ]);
+        for platform in ["windows", "win32", "linux", "macos"] {
+            assert_eq!(
+                resolve_state_dir_for_env(platform, "C:\\Users\\dev", &env),
+                PathBuf::from("/tmp/scratch/claude-code-proxy"),
+                "{platform}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_and_node_platform_names_agree_on_macos() {
+        let env = env(&[]);
+        assert_eq!(
+            resolve_config_dir_for_env("macos", "/Users/dev", &env),
+            resolve_config_dir_for_env("darwin", "/Users/dev", &env)
+        );
+    }
 }
