@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
+use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
@@ -568,6 +569,9 @@ async fn live_stream_response_once(
 ) -> LiveStreamStart {
     let mut translator = LiveStreamTranslator::new(message_id, model.to_string());
     let mut upstream_sse_body = Vec::new();
+    // Keep protocol framing private until real output makes a transparent retry unsafe.
+    // Every branch that consumes pending_chunk returns, so it is never flushed twice.
+    let mut pending_chunk = Vec::new();
     let mut generation_started = false;
 
     while let Some(item) = upstream_events.recv().await {
@@ -593,7 +597,7 @@ async fn live_stream_response_once(
             generation_started = true;
         }
         append_upstream_sse_payload(&mut upstream_sse_body, &payload);
-        let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, &ctx)
+        let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, None)
         {
             Ok(result) => result,
             Err(message) => {
@@ -639,8 +643,18 @@ async fn live_stream_response_once(
                 return LiveStreamStart::Response(map_codex_failure_to_response(&message));
             }
         };
-        if !chunk.is_empty() {
-            record_live_stream_progress(&ctx, &chunk);
+        pending_chunk.extend_from_slice(&chunk);
+        if terminal
+            && is_codex_success_terminal_event(&payload)
+            && !translator.has_semantic_output()
+        {
+            return LiveStreamStart::Retry {
+                error: empty_live_completion_error(),
+            };
+        }
+        if translator.has_semantic_output() && !pending_chunk.is_empty() {
+            record_live_stream_downstream_capture(&ctx, &pending_chunk);
+            record_live_stream_progress(&ctx, &pending_chunk);
             if terminal {
                 update_continuation_from_upstream(
                     ctx.session_id.as_deref(),
@@ -649,12 +663,12 @@ async fn live_stream_response_once(
                     &upstream_sse_body,
                     compact_boundary,
                 );
-                return LiveStreamStart::Response(single_live_stream_response(chunk));
+                return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
             }
             return LiveStreamStart::Response(remaining_live_stream_response(
                 upstream_events,
                 translator,
-                chunk,
+                pending_chunk,
                 ctx,
                 turn_id,
                 request_body,
@@ -670,7 +684,12 @@ async fn live_stream_response_once(
                 &upstream_sse_body,
                 compact_boundary,
             );
-            return LiveStreamStart::Response(empty_live_stream_response());
+            if pending_chunk.is_empty() {
+                return LiveStreamStart::Response(empty_live_stream_response());
+            }
+            record_live_stream_downstream_capture(&ctx, &pending_chunk);
+            record_live_stream_progress(&ctx, &pending_chunk);
+            return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
         }
     }
 
@@ -685,6 +704,16 @@ async fn live_stream_response_once(
     }
 }
 
+fn empty_live_completion_error() -> client::CodexError {
+    client::CodexError {
+        status: 503,
+        message: "Codex completed without producing output".to_string(),
+        detail: Some(EMPTY_CODEX_COMPLETION_DETAIL.to_string()),
+        retry_after: None,
+        origin: client::CodexErrorOrigin::WebSocket,
+    }
+}
+
 fn codex_generation_event(payload: &serde_json::Value) -> bool {
     !matches!(
         payload.get("type").and_then(|value| value.as_str()),
@@ -695,11 +724,29 @@ fn codex_generation_event(payload: &serde_json::Value) -> bool {
 fn translate_live_stream_payload(
     translator: &mut LiveStreamTranslator,
     payload: &serde_json::Value,
-    ctx: &RequestContext,
+    traffic: Option<&crate::traffic::TrafficCapture>,
 ) -> Result<(Vec<u8>, bool), String> {
-    let chunk = translator.accept(payload, ctx.traffic.as_deref())?;
+    let chunk = translator.accept(payload, traffic)?;
     let terminal = is_codex_terminal_event(payload) || translator.is_finished();
     Ok((chunk, terminal))
+}
+
+fn record_live_stream_downstream_capture(ctx: &RequestContext, chunk: &[u8]) {
+    let Some(traffic) = ctx.traffic.as_ref() else {
+        return;
+    };
+    for event in parse_sse_events(chunk) {
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&event.data) else {
+            continue;
+        };
+        traffic.write_json_event(
+            "050-downstream-event",
+            &serde_json::json!({
+                "event": event.event.as_deref().unwrap_or("message"),
+                "data": data,
+            }),
+        );
+    }
 }
 
 fn record_live_stream_progress(ctx: &RequestContext, chunk: &[u8]) {
@@ -751,28 +798,31 @@ fn remaining_live_stream_response(
             match item {
                 Ok(payload) => {
                     append_upstream_sse_payload(&mut upstream_sse_body, &payload);
-                    let (chunk, terminal) =
-                        match translate_live_stream_payload(&mut translator, &payload, &ctx) {
-                            Ok(result) => result,
-                            Err(message) => {
-                                abort_request_state(
-                                    ctx.session_id.as_deref(),
-                                    turn_id,
-                                    compact_boundary,
-                                    &request_body,
-                                );
-                                let chunk = translator.error_chunk(
-                                    &message,
-                                    "api_error",
-                                    ctx.traffic.as_deref(),
-                                );
-                                if !chunk.is_empty() {
-                                    record_live_stream_progress(&ctx, &chunk);
-                                    let _ = tx.send(Ok(Bytes::from(chunk))).await;
-                                }
-                                return;
+                    let (chunk, terminal) = match translate_live_stream_payload(
+                        &mut translator,
+                        &payload,
+                        ctx.traffic.as_deref(),
+                    ) {
+                        Ok(result) => result,
+                        Err(message) => {
+                            abort_request_state(
+                                ctx.session_id.as_deref(),
+                                turn_id,
+                                compact_boundary,
+                                &request_body,
+                            );
+                            let chunk = translator.error_chunk(
+                                &message,
+                                "api_error",
+                                ctx.traffic.as_deref(),
+                            );
+                            if !chunk.is_empty() {
+                                record_live_stream_progress(&ctx, &chunk);
+                                let _ = tx.send(Ok(Bytes::from(chunk))).await;
                             }
-                        };
+                            return;
+                        }
+                    };
                     if !chunk.is_empty() {
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
@@ -924,6 +974,13 @@ fn is_codex_terminal_event(payload: &serde_json::Value) -> bool {
             | Some("response.failed")
             | Some("response.error")
             | Some("error")
+    )
+}
+
+fn is_codex_success_terminal_event(payload: &serde_json::Value) -> bool {
+    matches!(
+        payload.get("type").and_then(|v| v.as_str()),
+        Some("response.completed") | Some("response.done")
     )
 }
 
@@ -1479,6 +1536,18 @@ mod tests {
         assert_eq!(
             body.pointer("/error/message").and_then(|v| v.as_str()),
             Some("WebSocket connect error: HTTP error: 502 Bad Gateway")
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_live_completion_maps_to_explicit_service_unavailable() {
+        let err = empty_live_completion_error();
+
+        assert_eq!(err.status, 503);
+        assert_eq!(err.detail.as_deref(), Some(EMPTY_CODEX_COMPLETION_DETAIL));
+        assert_eq!(
+            map_codex_error_to_response(&err).status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 

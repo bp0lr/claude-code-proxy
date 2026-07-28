@@ -538,6 +538,144 @@ async fn spawn_websocket_close_then_retry_upstream(captured: Arc<Mutex<Vec<Value
     addr_str
 }
 
+async fn spawn_websocket_empty_completion_then_retry_upstream(
+    captured: Arc<Mutex<Vec<Value>>>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        let mut handled = 0usize;
+        while handled < 3 {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let (mut sender, mut receiver) = ws.split();
+
+            while handled < 3 {
+                let Some(text) = (loop {
+                    match receiver.next().await {
+                        Some(Ok(Message::Text(text))) => break Some(text),
+                        Some(Ok(Message::Ping(data))) => {
+                            let _ = sender.send(Message::Pong(data)).await;
+                        }
+                        Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(_)) => {}
+                        Some(Err(_)) | None => break None,
+                    }
+                }) else {
+                    break;
+                };
+                if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                    let _ = captured.lock().map(|mut g| g.push(json));
+                }
+
+                if handled == 1 {
+                    let event = json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_empty",
+                            "status": "completed",
+                            "incomplete_details": null,
+                            "usage": {"input_tokens": 5, "output_tokens": 0}
+                        }
+                    });
+                    let _ = sender.send(Message::Text(event.to_string())).await;
+                    handled += 1;
+                    continue;
+                }
+
+                let response_text = if handled == 0 { "first" } else { "retry" };
+                let response_id = if handled == 0 { "resp_1" } else { "resp_retry" };
+                let events = [
+                    json!({
+                        "type":"response.output_item.added",
+                        "output_index":0,
+                        "item":{"type":"message","id":format!("msg_empty_{handled}")}
+                    }),
+                    json!({
+                        "type":"response.output_text.delta",
+                        "output_index":0,
+                        "delta":response_text
+                    }),
+                    json!({
+                        "type":"response.output_item.done",
+                        "output_index":0,
+                        "item":{"type":"message"}
+                    }),
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":response_id,"usage":{"input_tokens":5,"output_tokens":2}}
+                    }),
+                ];
+
+                for event in &events {
+                    let _ = sender.send(Message::Text(event.to_string())).await;
+                }
+                handled += 1;
+            }
+        }
+    });
+
+    addr_str
+}
+
+/// Upstream that answers every request with a terminal-only completion,
+/// so the proxy's bounded retry loop always exhausts.
+async fn spawn_websocket_always_empty_completion_upstream(
+    request_count: Arc<std::sync::atomic::AtomicUsize>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let (mut sender, mut receiver) = ws.split();
+            let request_count = request_count.clone();
+
+            tokio::spawn(async move {
+                while let Some(message) = receiver.next().await {
+                    match message {
+                        Ok(Message::Text(_)) => {
+                            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let event = json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": "resp_empty",
+                                    "status": "completed",
+                                    "incomplete_details": null,
+                                    "usage": {"input_tokens": 5, "output_tokens": 0}
+                                }
+                            });
+                            if sender.send(Message::Text(event.to_string())).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(Message::Ping(data)) => {
+                            let _ = sender.send(Message::Pong(data)).await;
+                        }
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+            });
+        }
+    });
+
+    addr_str
+}
+
 // ---------------------------------------------------------------------------
 // Health and routing smoke tests (no env var mutation needed)
 // ---------------------------------------------------------------------------
@@ -1730,6 +1868,140 @@ async fn smoke_codex_websocket_stream_retries_empty_close_with_full_context() {
         guard[2]["input"].as_array().map(Vec::len),
         Some(3),
         "retry request should send the full input"
+    );
+
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_stream_retries_terminal_only_completion_with_full_context() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_websocket_empty_completion_then_retry_upstream(captured.clone()).await;
+
+    let _traffic_env = EnvGuard::set("CCP_TRAFFIC_LOG", "1");
+    let _state_env = EnvGuard::set("XDG_STATE_HOME", state.path());
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+    let _previous_response_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
+
+    let first = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"one"}]
+    }))
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let second = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [
+            {"role":"user","content":"one"},
+            {"role":"assistant","content":"first"},
+            {"role":"user","content":"two"}
+        ]
+    }))
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&second_body).contains("retry"),
+        "second response body: {}",
+        String::from_utf8_lossy(&second_body)
+    );
+
+    let downstream_end_turns = traffic_files(state.path())
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("050-downstream-event.json"))
+        })
+        .filter_map(|path| std::fs::read(path).ok())
+        .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(|event| event["data"]["delta"]["stop_reason"] == "end_turn")
+        .count();
+    assert_eq!(
+        downstream_end_turns, 2,
+        "discarded empty attempts must not be captured as downstream events"
+    );
+
+    let guard = captured.lock().unwrap();
+    assert_eq!(guard.len(), 3, "expected full-context retry request");
+    assert!(guard[0].get("previous_response_id").is_none());
+    assert_eq!(guard[1]["previous_response_id"], "resp_1");
+    assert!(guard[2].get("previous_response_id").is_none());
+    assert_eq!(
+        guard[2]["input"].as_array().map(Vec::len),
+        Some(3),
+        "retry request should send the full input"
+    );
+
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_empty_completions_exhaust_to_service_unavailable() {
+    let _guard = env_lock();
+    let _delay_guard = ZeroRetryDelayGuard::enable();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream = spawn_websocket_always_empty_completion_upstream(request_count.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"one"}]
+    }))
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body);
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "exhausted empty completions must surface an explicit error: {body_text}"
+    );
+    assert!(
+        body_text.contains("Codex completed without producing output"),
+        "unexpected exhaustion body: {body_text}"
+    );
+    // Initial attempt plus MAX_RETRYABLE_LIVE_STREAM_RETRIES full-context retries.
+    assert_eq!(
+        request_count.load(std::sync::atomic::Ordering::SeqCst),
+        11,
+        "retry loop must stay bounded"
     );
 
     clear_all_continuations_for_tests();
