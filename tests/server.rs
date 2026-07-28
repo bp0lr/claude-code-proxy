@@ -232,6 +232,26 @@ async fn context_window_hint_is_removed_before_provider_dispatch() {
 }
 
 #[tokio::test]
+async fn opus_5_alias_routes_to_provider() {
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .body(body_string(
+                    r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn native_responses_route_is_disabled_by_default_option() {
     let app = app_with_options(Arc::new(Registry::with_default_alias()), None, false);
     let response = app
@@ -458,6 +478,7 @@ async fn models_endpoint_includes_claude_prefixed_aliases_for_discovery() {
         .map(|m| m["id"].as_str().unwrap())
         .collect();
     assert!(ids.iter().any(|id| id.starts_with("claude-")));
+    assert!(ids.contains(&"claude-opus-5"));
 }
 
 #[tokio::test]

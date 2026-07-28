@@ -691,7 +691,7 @@ mod tests {
 
     #[test]
     fn native_request_resolves_alias_and_fast_tier() {
-        let mut body = request(json!({"model":"claude-opus-4-8","input":[]}));
+        let mut body = request(json!({"model":"claude-opus-5","input":[]}));
         let resolved = shape_native_request(&mut body).unwrap();
         assert_eq!(resolved.model, "gpt-5.6-sol");
         assert_eq!(body["model"], "gpt-5.6-sol");

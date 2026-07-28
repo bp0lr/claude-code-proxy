@@ -19,6 +19,7 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "opus",
     "claude-opus-4-7",
     "claude-opus-4-8",
+    "claude-opus-5",
     "fable",
     "claude-fable-5",
 ];
@@ -342,7 +343,12 @@ mod tests {
     #[test]
     fn claude_5_aliases_route_to_configured_provider() {
         let registry = Registry::new(AliasProvider::Codex);
-        for model in ["claude-sonnet-5", "fable", "claude-fable-5"] {
+        for model in [
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "fable",
+            "claude-fable-5",
+        ] {
             let p = registry.provider_for_model(model, None);
             assert!(p.is_some(), "{model} should route to a provider");
             assert_eq!(p.expect("provider").name(), "codex");
