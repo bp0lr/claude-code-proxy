@@ -34,6 +34,64 @@ use std::time::Instant;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
+const CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX: &str =
+    "You are a security monitor for autonomous AI coding agents.";
+const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-5.6-luna";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutoReviewRoute {
+    requested_model: String,
+    override_model: String,
+}
+
+fn is_claude_auto_review_request(body: &crate::anthropic::schema::MessagesRequest) -> bool {
+    if body.stream {
+        return false;
+    }
+
+    let has_tools = body
+        .extra
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    if has_tools {
+        return false;
+    }
+
+    body.extra
+        .get("system")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.starts_with(CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX))
+            })
+        })
+}
+
+fn apply_auto_review_model(
+    body: &mut crate::anthropic::schema::MessagesRequest,
+    count_tokens: bool,
+    configured_model: Option<&str>,
+    original_provider: &str,
+) -> Option<AutoReviewRoute> {
+    if count_tokens || !is_claude_auto_review_request(body) {
+        return None;
+    }
+
+    let override_model = configured_model
+        .filter(|model| !model.is_empty())
+        .or((original_provider == "codex").then_some(CODEX_AUTO_REVIEW_MODEL))?;
+    let route = AutoReviewRoute {
+        requested_model: body.model.clone()?,
+        override_model: override_model.to_string(),
+    };
+    body.model = Some(route.override_model.clone());
+    Some(route)
+}
+
 pub struct ServerConfig {
     pub bind_address: String,
     pub port: u16,
@@ -795,20 +853,38 @@ async fn dispatch_request(
         }
     };
 
-    let normalized_model = normalize_incoming_model(model);
+    let mut normalized_model = normalize_incoming_model(model);
     body.model = Some(normalized_model.clone());
     let session_state = if let Some(session_id) = session_id.as_deref() {
         session::existing_session(Some(session_id), now)
     } else {
         None
     };
+    let session_affinity = session_state
+        .as_ref()
+        .and_then(|state| state.affinity_provider.as_ref());
+    let original_provider = state
+        .registry
+        .provider_for_model(&normalized_model, session_affinity);
+    let configured_auto_review_model = crate::config::auto_review_model();
+    let auto_review_route = original_provider.as_ref().and_then(|provider| {
+        apply_auto_review_model(
+            &mut body,
+            count_tokens,
+            configured_auto_review_model.as_deref(),
+            provider.name(),
+        )
+    });
+    if auto_review_route.is_some() {
+        normalized_model = normalize_incoming_model(body.model.as_deref().expect("override model"));
+        body.model = Some(normalized_model.clone());
+    }
 
-    let provider = state.registry.provider_for_model(
-        &normalized_model,
-        session_state
-            .as_ref()
-            .and_then(|state| state.affinity_provider.as_ref()),
-    );
+    let provider = if auto_review_route.is_some() {
+        state.registry.provider_for_model(&normalized_model, None)
+    } else {
+        original_provider
+    };
 
     let provider = match provider {
         Some(provider) => provider,
@@ -864,7 +940,22 @@ async fn dispatch_request(
         }
     };
 
+    body.bypass_provider_model_override = auto_review_route.is_some() && provider.name() == "codex";
+
+    if let Some(route) = auto_review_route.as_ref() {
+        log.info(
+            "auto-review route selected",
+            Some(Map::from_iter([
+                ("reqId".to_string(), json!(&req_id)),
+                ("requestedModel".to_string(), json!(&route.requested_model)),
+                ("overrideModel".to_string(), json!(&route.override_model)),
+                ("provider".to_string(), json!(provider.name())),
+            ])),
+        );
+    }
+
     if !count_tokens
+        && auto_review_route.is_none()
         && provider.name() != "codex"
         && let Some(session_id) = session_id.as_deref()
     {
@@ -875,11 +966,12 @@ async fn dispatch_request(
         .ok()
         .flatten()
         .map(str::to_string);
-    let current = session::record_session_request(
+    let current = session::record_session_request_with_affinity_update(
         session_id.as_deref(),
         session_state.as_ref(),
         provider.name(),
         &normalized_model,
+        auto_review_route.is_none(),
         now,
     );
     if let Some(monitor) = state.monitor.as_ref() {
@@ -1416,5 +1508,105 @@ mod tests {
         }
         prune_error_captures(temp.path());
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 5);
+    }
+}
+
+#[cfg(test)]
+mod auto_review_tests {
+    use super::{apply_auto_review_model, is_claude_auto_review_request};
+    use crate::anthropic::schema::MessagesRequest;
+    use serde_json::json;
+
+    fn request(system: &str, stream: bool, tools: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 2112,
+            "stream": stream,
+            "system": [{"type": "text", "text": system}],
+            "messages": [{"role": "user", "content": "review this Bash command"}],
+            "tools": tools
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn detects_claude_auto_review_classifier() {
+        let body = request(
+            "You are a security monitor for autonomous AI coding agents.\n\n## Context",
+            false,
+            json!([]),
+        );
+        assert!(is_claude_auto_review_request(&body));
+    }
+
+    #[test]
+    fn ignores_normal_streaming_and_tool_using_requests() {
+        assert!(!is_claude_auto_review_request(&request(
+            "You are an interactive coding agent.",
+            false,
+            json!([]),
+        )));
+        assert!(!is_claude_auto_review_request(&request(
+            "You are a security monitor for autonomous AI coding agents.",
+            true,
+            json!([]),
+        )));
+        assert!(!is_claude_auto_review_request(&request(
+            "You are a security monitor for autonomous AI coding agents.",
+            false,
+            json!([{"name": "Bash"}]),
+        )));
+    }
+
+    #[test]
+    fn codex_classifier_defaults_to_luna() {
+        let mut classifier = request(
+            "You are a security monitor for autonomous AI coding agents.",
+            false,
+            json!([]),
+        );
+        let route = apply_auto_review_model(&mut classifier, false, None, "codex")
+            .expect("classifier should be routed");
+        assert_eq!(route.requested_model, "gpt-5.6-sol");
+        assert_eq!(route.override_model, "gpt-5.6-luna");
+        assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn non_codex_classifier_keeps_requested_model_without_override() {
+        let mut classifier = request(
+            "You are a security monitor for autonomous AI coding agents.",
+            false,
+            json!([]),
+        );
+        classifier.model = Some("kimi-for-coding".to_string());
+        assert!(apply_auto_review_model(&mut classifier, false, None, "kimi").is_none());
+        assert_eq!(classifier.model.as_deref(), Some("kimi-for-coding"));
+    }
+
+    #[test]
+    fn configured_model_overrides_provider_default() {
+        let mut classifier = request(
+            "You are a security monitor for autonomous AI coding agents.",
+            false,
+            json!([]),
+        );
+        let route = apply_auto_review_model(&mut classifier, false, Some("grok-4.5"), "codex")
+            .expect("configured classifier should be routed");
+        assert_eq!(route.override_model, "grok-4.5");
+        assert_eq!(classifier.model.as_deref(), Some("grok-4.5"));
+    }
+
+    #[test]
+    fn count_tokens_keeps_requested_model() {
+        let mut classifier = request(
+            "You are a security monitor for autonomous AI coding agents.",
+            false,
+            json!([]),
+        );
+        assert!(
+            apply_auto_review_model(&mut classifier, true, Some("grok-4.5"), "codex").is_none()
+        );
+        assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-sol"));
     }
 }

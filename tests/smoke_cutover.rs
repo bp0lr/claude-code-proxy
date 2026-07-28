@@ -695,6 +695,76 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn smoke_auto_review_uses_codex_default_and_configured_override() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            captured.lock().unwrap().push(body);
+            concat!(
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"review ok\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+            )
+            .as_bytes()
+            .to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _codex_model_env = EnvGuard::set("CCP_CODEX_MODEL", "gpt-5.6-sol");
+    let classifier_body = || {
+        json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64,
+            "stream": false,
+            "system": [{
+                "type": "text",
+                "text": "You are a security monitor for autonomous AI coding agents.\n\n## Context"
+            }],
+            "messages": [{"role":"user","content":"review this Bash command"}],
+            "tools": []
+        })
+    };
+
+    let classifier = call_messages_body(classifier_body()).await;
+    assert_eq!(classifier.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(classifier.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    {
+        let _review_model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "gpt-5.6-terra");
+        let classifier = call_messages_body(classifier_body()).await;
+        assert_eq!(classifier.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(classifier.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+
+    let normal = call_messages("gpt-5.6-sol").await;
+    assert_eq!(normal.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(normal.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let sent = captured.lock().unwrap();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[0]["model"], "gpt-5.6-luna");
+    assert_eq!(sent[1]["model"], "gpt-5.6-terra");
+    assert_eq!(sent[2]["model"], "gpt-5.6-sol");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_http_server_compaction_replays_native_history() {
     let _guard = env_lock();
     clear_all_compactions_for_tests();
