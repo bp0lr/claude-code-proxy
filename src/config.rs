@@ -347,6 +347,62 @@ pub fn grok_client_version() -> String {
     "0.2.93".to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Grok tool-image policy (CCP_GROK_TOOL_IMAGE)
+// ---------------------------------------------------------------------------
+
+/// How the Grok translator treats Anthropic `image` blocks (tool results and
+/// top-level user messages). `omit` is the safe default: degrade to the L1
+/// placeholder string. `reattach` keeps the placeholder in the tool output and
+/// additionally appends a user message carrying the images as `input_image`
+/// data URLs. `inline` sends the tool output itself as an array of
+/// `input_text` + `input_image` parts (string-only outputs still serialize as
+/// plain strings). `reject` restores the pre-L1 hard error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokToolImageMode {
+    Omit,
+    Reattach,
+    Inline,
+    Reject,
+}
+
+pub fn parse_grok_tool_image_mode(raw: Option<&str>) -> GrokToolImageMode {
+    match raw.map(str::trim) {
+        Some("reattach") => GrokToolImageMode::Reattach,
+        Some("inline") => GrokToolImageMode::Inline,
+        Some("reject") => GrokToolImageMode::Reject,
+        // Any unknown/empty value degrades to the safe default.
+        _ => GrokToolImageMode::Omit,
+    }
+}
+
+pub fn grok_tool_image_mode() -> GrokToolImageMode {
+    parse_grok_tool_image_mode(std::env::var("CCP_GROK_TOOL_IMAGE").ok().as_deref())
+}
+
+/// Warn once at startup when an unknown mode was requested. Called from the
+/// Grok provider constructor rather than per request.
+pub fn warn_grok_tool_image_mode_once(log: &crate::logging::Logger) {
+    match std::env::var("CCP_GROK_TOOL_IMAGE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some(other) if !matches!(other, "" | "omit" | "reattach" | "inline" | "reject") => {
+            let mut fields = serde_json::Map::new();
+            fields.insert(
+                "value".to_string(),
+                serde_json::Value::String(other.to_string()),
+            );
+            log.warn(
+                "unrecognized CCP_GROK_TOOL_IMAGE value; falling back to omit",
+                Some(fields),
+            );
+        }
+        _ => {}
+    }
+}
+
 pub fn is_verbose() -> bool {
     log_verbose()
 }

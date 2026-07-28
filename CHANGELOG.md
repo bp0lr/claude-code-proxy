@@ -3,6 +3,12 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- Grok handles images in user messages and tool results without failing requests.
+  Images are omitted by default, with opt-in vision through
+  `CCP_GROK_TOOL_IMAGE`. Traffic captures redact image payloads.
+
 ## v0.1.25 (2026-07-24)
 
 - Kimi users can select Kimi K3 with the `kimi-k3` or `k3` model name, including
