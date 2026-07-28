@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod chat_completions;
 pub mod client;
 pub mod compaction;
 pub mod continuation;

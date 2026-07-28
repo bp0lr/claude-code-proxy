@@ -17,6 +17,7 @@ pub enum EndpointKind {
     Messages,
     CountTokens,
     Responses,
+    ChatCompletions,
 }
 
 impl EndpointKind {
@@ -25,6 +26,7 @@ impl EndpointKind {
             Self::Messages => "messages",
             Self::CountTokens => "count_tokens",
             Self::Responses => "responses",
+            Self::ChatCompletions => "chat_completions",
         }
     }
 }

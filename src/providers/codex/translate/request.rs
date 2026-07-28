@@ -259,7 +259,7 @@ pub struct TranslateOptions {
 // Translation entry point
 // ---------------------------------------------------------------------------
 
-fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
+pub(crate) fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
     match effort {
         Some("max") => Some(Effort::Max),
         Some("xhigh") => Some(Effort::Xhigh),
@@ -274,7 +274,7 @@ fn resolve_effort(effort: Option<Effort>) -> Result<Option<Effort>, anyhow::Erro
     resolve_effort_override(effort, config::codex_effort().as_deref())
 }
 
-fn resolve_effort_override(
+pub(crate) fn resolve_effort_override(
     effort: Option<Effort>,
     override_effort: Option<&str>,
 ) -> Result<Option<Effort>, anyhow::Error> {

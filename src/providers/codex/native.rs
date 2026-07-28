@@ -223,7 +223,7 @@ impl NativeResponseOutcome {
         self.failure.lock().ok().and_then(|failure| failure.clone())
     }
 
-    fn fail(&self, message: String) {
+    pub(crate) fn fail(&self, message: String) {
         if let Ok(mut failure) = self.failure.lock()
             && failure.is_none()
         {

@@ -4,8 +4,11 @@ use crate::{
     monitor::{EndpointKind, MonitorHandle},
     project,
     provider::RequestContext,
-    providers::codex::native::{
-        CodexNativeBackend, NativeResponseOutcome, openai_error, validate_native_request_model,
+    providers::codex::{
+        chat_completions::{ChatCompletionsBackend, request::translate_request},
+        native::{
+            CodexNativeBackend, NativeResponseOutcome, openai_error, validate_native_request_model,
+        },
     },
     registry::{Registry, normalize_incoming_model},
     session::{self, SessionState},
@@ -117,10 +120,12 @@ pub fn app_with_options(
     responses_api: bool,
 ) -> Router {
     let native_responses = responses_api.then(|| Arc::new(CodexNativeBackend::new()));
+    let chat_completions = responses_api.then(|| Arc::new(ChatCompletionsBackend::new()));
     let state = Arc::new(AppState {
         registry,
         monitor,
         native_responses,
+        chat_completions,
     });
     let router = Router::new()
         .route("/healthz", get(healthz))
@@ -129,7 +134,9 @@ pub fn app_with_options(
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .route("/v1/models", get(handler_models));
     let router = if responses_api {
-        router.route("/v1/responses", post(handler_responses))
+        router
+            .route("/v1/responses", post(handler_responses))
+            .route("/v1/chat/completions", post(handler_chat_completions))
     } else {
         router
     };
@@ -141,6 +148,7 @@ struct AppState {
     registry: Arc<Registry>,
     monitor: Option<MonitorHandle>,
     native_responses: Option<Arc<CodexNativeBackend>>,
+    chat_completions: Option<Arc<ChatCompletionsBackend>>,
 }
 
 async fn healthz() -> Json<serde_json::Value> {
@@ -256,19 +264,40 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
                 None,
                 Some("invalid_json"),
             );
-            log_native_request_completed(&log, &req_id, None, response.status(), started_at);
+            log_native_request_completed(
+                &log,
+                &req_id,
+                "responses",
+                None,
+                response.status(),
+                started_at,
+            );
             return monitor_response_body(response, request_guard);
         }
     };
     let body: Value = match parse_native_json_body(&body_bytes) {
         Ok(body) => body,
         Err(response) => {
-            log_native_request_completed(&log, &req_id, None, response.status(), started_at);
+            log_native_request_completed(
+                &log,
+                &req_id,
+                "responses",
+                None,
+                response.status(),
+                started_at,
+            );
             return monitor_response_body(response, request_guard);
         }
     };
     if let Err(response) = validate_native_request_model(&body) {
-        log_native_request_completed(&log, &req_id, None, response.status(), started_at);
+        log_native_request_completed(
+            &log,
+            &req_id,
+            "responses",
+            None,
+            response.status(),
+            started_at,
+        );
         return monitor_response_body(response, request_guard);
     }
     let model = body
@@ -354,7 +383,176 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
     log_native_request_completed(
         &log,
         &req_id,
+        "responses",
         model.as_deref(),
+        response.status(),
+        started_at,
+    );
+    monitor_response_body(response, request_guard)
+}
+
+async fn handler_chat_completions(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+) -> Response {
+    let started_at = Instant::now();
+    let log = create_logger("server");
+    let req_id = Uuid::new_v4().to_string();
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let headers = req.headers().clone();
+    let path = uri.path().to_string();
+    let query = redacted_query(&uri);
+    log.info(
+        "request",
+        Some(serde_json::Map::from_iter([
+            ("reqId".to_string(), json!(&req_id)),
+            ("method".to_string(), json!(method.as_str())),
+            ("path".to_string(), json!(&path)),
+            ("query".to_string(), json!(&query)),
+        ])),
+    );
+
+    let session_id = native_session_id(&headers);
+    if let Some(monitor) = state.monitor.as_ref() {
+        monitor.request_started(
+            &req_id,
+            session_id.clone(),
+            None,
+            EndpointKind::ChatCompletions,
+        );
+    }
+    let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
+    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let response = openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Invalid JSON: {error}"),
+                None,
+                Some("invalid_json"),
+            );
+            log_native_request_completed(
+                &log,
+                &req_id,
+                "chat_completions",
+                None,
+                response.status(),
+                started_at,
+            );
+            return monitor_response_body(response, request_guard);
+        }
+    };
+    let body = match parse_native_json_body(&body_bytes) {
+        Ok(body) => body,
+        Err(response) => {
+            log_native_request_completed(
+                &log,
+                &req_id,
+                "chat_completions",
+                None,
+                response.status(),
+                started_at,
+            );
+            return monitor_response_body(response, request_guard);
+        }
+    };
+    let translated = match translate_request(body.clone()) {
+        Ok(translated) => translated,
+        Err(error) => {
+            let response = error.response();
+            log_native_request_completed(
+                &log,
+                &req_id,
+                "chat_completions",
+                None,
+                response.status(),
+                started_at,
+            );
+            return monitor_response_body(response, request_guard);
+        }
+    };
+
+    let now = current_millis();
+    let session_state = session_id
+        .as_deref()
+        .and_then(|session_id| session::existing_session(Some(session_id), now));
+    let current = session::record_session_request(
+        session_id.as_deref(),
+        session_state.as_ref(),
+        "codex",
+        &translated.model,
+        now,
+    );
+    if let Some(monitor) = state.monitor.as_ref() {
+        if let Some(current) = current.as_ref() {
+            monitor.session_sequence_resolved(&req_id, current.seq);
+        }
+        monitor.provider_selected(
+            &req_id,
+            "codex",
+            &translated.model,
+            translated.effort.clone(),
+        );
+    }
+
+    let traffic = create_traffic_capture(TrafficCaptureOptions {
+        req_id: req_id.clone(),
+        session_id: session_id.clone(),
+        session_seq: current.as_ref().map(|state| state.seq),
+        provider: Some("codex".to_string()),
+        state_dir_override: None,
+    })
+    .map(Arc::new);
+    if let Some(capture) = traffic.as_ref() {
+        if let Some(monitor) = state.monitor.as_ref() {
+            monitor.traffic_capture_path(&req_id, capture.root().to_path_buf());
+        }
+        capture.write_json(
+            "000-metadata",
+            &json!({
+                "reqId": &req_id,
+                "sessionId": &session_id,
+                "sessionSeq": current.as_ref().map(|state| state.seq),
+                "kind": "chat_completions",
+                "provider": "codex",
+                "model": &translated.model,
+                "requestedModel": &translated.requested_model,
+                "effort": &translated.effort,
+                "method": method.as_str(),
+                "path": &path,
+                "query": &query,
+                "headers": headers_to_record(&headers),
+            }),
+        );
+        capture.write_json("010-openai-chat-completions-request", &body);
+        capture.write_json("020-upstream-request", &translated.upstream);
+    }
+
+    let context = RequestContext {
+        req_id: req_id.clone(),
+        session_id,
+        session_seq: current.map(|state| state.seq),
+        provider: "codex".to_string(),
+        traffic,
+        monitor: state.monitor.clone(),
+    };
+    let response = match state.chat_completions.as_ref() {
+        Some(backend) => backend.handle(translated.clone(), context).await,
+        None => openai_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "Chat Completions API is disabled",
+            None,
+            None,
+        ),
+    };
+    log_native_request_completed(
+        &log,
+        &req_id,
+        "chat_completions",
+        Some(&translated.model),
         response.status(),
         started_at,
     );
@@ -402,6 +600,7 @@ fn parse_native_json_body(body: &[u8]) -> Result<Value, Response> {
 fn log_native_request_completed(
     log: &Logger,
     req_id: &str,
+    endpoint: &str,
     model: Option<&str>,
     status: StatusCode,
     started_at: Instant,
@@ -410,7 +609,7 @@ fn log_native_request_completed(
         "request_completed",
         Some(serde_json::Map::from_iter([
             ("reqId".to_string(), json!(req_id)),
-            ("endpoint".to_string(), json!("responses")),
+            ("endpoint".to_string(), json!(endpoint)),
             ("provider".to_string(), json!("codex")),
             ("model".to_string(), json!(model)),
             ("countTokens".to_string(), json!(false)),

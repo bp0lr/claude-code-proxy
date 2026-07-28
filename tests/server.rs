@@ -296,6 +296,74 @@ async fn enabled_native_responses_route_uses_openai_errors() {
 }
 
 #[tokio::test]
+async fn chat_completions_route_uses_responses_api_gate() {
+    let disabled = app_with_options(Arc::new(Registry::with_default_alias()), None, false);
+    let response = disabled
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(body_string(
+                    r#"{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let enabled = app_with_options(Arc::new(Registry::with_default_alias()), None, true);
+    let response = enabled
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(body_string("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], "invalid_json");
+}
+
+#[tokio::test]
+async fn chat_completions_validation_returns_openai_parameter_errors() {
+    let app = app_with_options(Arc::new(Registry::with_default_alias()), None, true);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(body_string(
+                    r#"{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}],"max_tokens":100}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"]["param"], "max_tokens");
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+}
+
+#[tokio::test]
 async fn unknown_routes_use_anthropic_not_found_error() {
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app

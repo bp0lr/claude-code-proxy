@@ -1,6 +1,6 @@
 ---
 title: Codex
-description: Configure ChatGPT Codex authentication, models, reasoning, tools, images, transports, continuation, compaction, and native Responses passthrough.
+description: Configure ChatGPT Codex authentication, models, reasoning, tools, images, transports, continuation, compaction, and OpenAI-compatible APIs.
 ---
 
 Codex uses the ChatGPT subscription Responses endpoint at `https://chatgpt.com/backend-api/codex/responses`.
@@ -89,8 +89,12 @@ Replay requires the same Claude Code session and Codex model with append-only hi
 
 While the native request is active, the monitor shows `compacting`. Structured log events named `server_compaction_triggered`, `server_compaction_completed`, and `server_compaction_failed` report each attempt and outcome.
 
-## Native Responses API
+## OpenAI-compatible APIs
 
-`CCP_CODEX_RESPONSES_API=1` enables `POST /v1/responses`. The proxy replaces incoming credentials with stored Codex auth and preserves native JSON or SSE response bodies. This route covers registered Codex models. Images API, response retrieval or deletion, and WebSocket ingress are outside its scope.
+`CCP_CODEX_RESPONSES_API=1` enables both `POST /v1/responses` and `POST /v1/chat/completions`.
+
+The Responses route preserves native JSON or SSE response bodies for registered Codex models. The Chat Completions route translates standard text messages, reasoning effort, JSON object or JSON Schema output, and buffered or streaming responses. Its omitted reasoning effort defaults to `medium`; the proxy-wide Codex effort override still takes precedence.
+
+The proxy replaces incoming credentials with stored Codex auth for both routes. Images API, response retrieval or deletion, function calling through Chat Completions, and WebSocket ingress are outside their scope. See [HTTP API](/reference/http-api/) for supported Chat Completions fields and error behavior.
 
 See [Configuration](/reference/configuration/) for every Codex setting and [Troubleshooting](/using/troubleshooting/) for auth, model, and transport failures.
