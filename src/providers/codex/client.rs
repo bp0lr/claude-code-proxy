@@ -11,6 +11,7 @@ use crate::traffic::TrafficCapture;
 use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIGINATOR};
 use super::auth::manager::CodexAuthManager;
 use super::auth::token_store::{DefaultCodexAuthStore, StoredAuth, file_store};
+use super::search::{SearchRequest, SearchResponse};
 use super::translate::request::ResponsesRequest;
 
 // ---------------------------------------------------------------------------
@@ -288,6 +289,14 @@ fn header_value(name: &str, value: &str) -> Result<http::HeaderValue, CodexError
         retry_after: None,
         origin: CodexErrorOrigin::Http,
     })
+}
+
+fn search_endpoint(base_url: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    match base_url.strip_suffix("/responses") {
+        Some(api_root) => format!("{api_root}/alpha/search"),
+        None => format!("{base_url}/alpha/search"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +883,68 @@ impl CodexHttpClient {
     ) -> Result<CodexResponse, CodexError> {
         self.post_codex_with_transport(body, ctx, continuation, crate::config::codex_transport())
             .await
+    }
+
+    pub async fn post_search(
+        &self,
+        body: &SearchRequest,
+        ctx: &RequestContext,
+    ) -> Result<SearchResponse, CodexError> {
+        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
+            status: 401,
+            message: "Auth error".to_string(),
+            detail: Some(e.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Auth,
+        })?;
+        let body_json = serde_json::to_string(body).map_err(|e| CodexError {
+            status: 500,
+            message: "Failed to serialize search request".to_string(),
+            detail: Some(e.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?;
+        let mut auth_refresh_attempted = false;
+        let mut retries = 0_u32;
+
+        loop {
+            let response = self.attempt_post_search(&auth, &body_json, ctx).await?;
+            if response.status == 401 && !auth_refresh_attempted {
+                auth_refresh_attempted = true;
+                auth = self
+                    .auth_manager
+                    .force_refresh(&auth.access)
+                    .await
+                    .map_err(auth_refresh_error)?;
+                continue;
+            }
+            if should_retry_codex_status(response.status)
+                && retries < MAX_BUFFERED_TRANSPORT_RETRIES
+            {
+                let retry_after = response
+                    .headers
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+                    .map(|(_, value)| value.as_str());
+                let delay = compute_backoff_delay(retries, retry_after);
+                if delay.exceeds_budget {
+                    return Err(codex_status_error(response));
+                }
+                retries += 1;
+                sleep(delay.wait_ms).await;
+                continue;
+            }
+            if !(200..300).contains(&response.status) {
+                return Err(codex_status_error(response));
+            }
+            return serde_json::from_slice(&response.body).map_err(|e| CodexError {
+                status: 502,
+                message: "Failed to decode Codex search response".to_string(),
+                detail: Some(e.to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            });
+        }
     }
 
     async fn post_codex_with_transport(
@@ -1521,6 +1592,107 @@ impl CodexHttpClient {
 
         Ok(CodexResponse {
             body: body_bytes,
+            status,
+            headers,
+            transport: ActualTransport::Http,
+        })
+    }
+
+    async fn attempt_post_search(
+        &self,
+        auth: &StoredAuth,
+        body_json: &str,
+        ctx: &RequestContext,
+    ) -> Result<CodexResponse, CodexError> {
+        let url = search_endpoint(&self.base_url);
+        let headers = build_codex_search_headers(auth, ctx)?;
+
+        if let Some(traffic) = ctx.traffic.as_deref() {
+            write_codex_http_request_capture(traffic, &url, &headers, body_json);
+        }
+
+        let mut request = self.client.post(&url);
+        for (key, value) in headers.iter() {
+            request = request.header(key.as_str(), value.as_bytes());
+        }
+        let started_at = Instant::now();
+        let mut response = tokio::time::timeout(
+            Duration::from_millis(self.header_timeout_ms),
+            request.body(body_json.to_string()).send(),
+        )
+        .await
+        .map_err(|_| CodexError {
+            status: 0,
+            message: format!(
+                "Timed out waiting {}ms for Codex search response headers",
+                self.header_timeout_ms
+            ),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?
+        .map_err(|e| CodexError {
+            status: 0,
+            message: format!("Codex search network error: {e}"),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?;
+
+        let status = response.status().as_u16();
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string(),
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let mut body = Vec::new();
+        let mut response_started = false;
+        loop {
+            let chunk = tokio::time::timeout(
+                Duration::from_millis(self.body_idle_timeout_ms),
+                response.chunk(),
+            )
+            .await
+            .map_err(|_| CodexError {
+                status: 0,
+                message: format!(
+                    "Timed out waiting {}ms for the next Codex search response body chunk",
+                    self.body_idle_timeout_ms
+                ),
+                detail: Some("http_response_body".to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            })?
+            .map_err(|e| CodexError {
+                status: 0,
+                message: format!("Transport error reading Codex search response body: {e}"),
+                detail: Some("http_response_body".to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            })?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            if !response_started {
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.generation_started(&ctx.req_id);
+                }
+                response_started = true;
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        if let Some(traffic) = ctx.traffic.as_deref() {
+            write_upstream_response_capture(traffic, status, started_at.elapsed(), &headers, &body);
+        }
+
+        Ok(CodexResponse {
+            body,
             status,
             headers,
             transport: ActualTransport::Http,
@@ -2336,6 +2508,77 @@ mod tests {
         server.await.unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"data: keep\n\n");
+    }
+
+    #[tokio::test]
+    async fn standalone_search_posts_json_to_alpha_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let header_end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap();
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert!(headers.starts_with("POST /alpha/search HTTP/1.1"));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("accept: application/json")
+            );
+            assert!(headers.contains("authorization: Bearer test"));
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[header_end + 4..]).unwrap();
+            assert_eq!(body["model"], "gpt-5.6-luna");
+            assert!(body.get("reasoning").is_none());
+            assert_eq!(body["commands"]["search_query"][0]["q"], "find Codex");
+
+            let response = serde_json::to_vec(&serde_json::json!({
+                "encrypted_output": "opaque",
+                "output": "search output",
+                "results": [{
+                    "type": "text_result",
+                    "ref_id": "turn0search0",
+                    "url": "https://example.com",
+                    "title": "Example"
+                }]
+            }))
+            .unwrap();
+            let response_headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            );
+            stream.write_all(response_headers.as_bytes()).await.unwrap();
+            stream.write_all(&response).await.unwrap();
+        });
+
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let request = super::super::search::SearchRequest {
+            id: "session".to_string(),
+            model: "gpt-5.6-luna".to_string(),
+            reasoning: None,
+            input: None,
+            commands: super::super::search::SearchCommands {
+                search_query: vec![super::super::search::SearchQuery {
+                    q: "find Codex".to_string(),
+                }],
+            },
+            settings: super::super::search::SearchSettings {
+                filters: None,
+                allowed_callers: vec!["direct"],
+                external_web_access: true,
+            },
+            max_output_tokens: 2_500,
+        };
+        let response = client
+            .post_search(&request, &http_test_context())
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(response.output, "search output");
+        assert_eq!(response.results.unwrap().len(), 1);
     }
 
     #[tokio::test]
