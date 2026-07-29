@@ -123,9 +123,28 @@ fn read_file_config(config_dir: &Path) -> Option<FileConfig> {
 }
 
 pub fn load_config() -> LoadedConfig {
-    let config_dir = paths::config_dir();
+    let env = paths::DirResolverEnv::default();
+    let config_dir = paths::resolve_config_dir(&env);
+    load_config_from_env(&env.env, config_dir)
+}
+
+pub fn load_config_for_env(env: &HashMap<String, String>) -> LoadedConfig {
+    let home = env
+        .get("HOME")
+        .or_else(|| env.get("USERPROFILE"))
+        .cloned()
+        .unwrap_or_else(|| "/".to_string());
+    let resolver_env = paths::DirResolverEnv {
+        platform: std::env::consts::OS.to_string(),
+        env: env.clone(),
+        home,
+    };
+    let config_dir = paths::resolve_config_dir(&resolver_env);
+    load_config_from_env(env, config_dir)
+}
+
+fn load_config_from_env(env: &HashMap<String, String>, config_dir: PathBuf) -> LoadedConfig {
     let file = read_file_config(&config_dir);
-    let env: HashMap<_, _> = std::env::vars().collect();
 
     let mut out = LoadedConfig {
         bind_address: "127.0.0.1".to_string(),
@@ -736,31 +755,34 @@ mod tests {
         }
     }
 
+    fn config_env(config: &tempfile::TempDir) -> HashMap<String, String> {
+        HashMap::from([(
+            "CCP_CONFIG_DIR".to_string(),
+            config.path().to_string_lossy().into_owned(),
+        )])
+    }
+
     #[test]
     fn bind_address_defaults_to_loopback() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let env = config_env(&config);
 
-        assert_eq!(load_config().bind_address, "127.0.0.1");
+        assert_eq!(load_config_for_env(&env).bind_address, "127.0.0.1");
     }
 
     #[test]
     fn bind_address_reads_config_and_env_takes_precedence() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"bindAddress":"192.0.2.10"}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let mut env = config_env(&config);
 
-        assert_eq!(load_config().bind_address, "192.0.2.10");
-        let _bind_env = EnvGuard::set("CCP_BIND_ADDRESS", "0.0.0.0");
-        assert_eq!(load_config().bind_address, "0.0.0.0");
+        assert_eq!(load_config_for_env(&env).bind_address, "192.0.2.10");
+        env.insert("CCP_BIND_ADDRESS".to_string(), "0.0.0.0".to_string());
+        assert_eq!(load_config_for_env(&env).bind_address, "0.0.0.0");
     }
 
     struct EnvGuard {
@@ -859,31 +881,27 @@ mod tests {
 
     #[test]
     fn log_env_presence_enables_legacy_verbose_and_stderr() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
-        let _verbose_env = EnvGuard::set("CCP_LOG_VERBOSE", "0");
-        let _stderr_env = EnvGuard::set("CCP_LOG_STDERR", "");
+        let mut env = config_env(&config);
+        env.insert("CCP_LOG_VERBOSE".to_string(), "0".to_string());
+        env.insert("CCP_LOG_STDERR".to_string(), String::new());
 
-        let loaded = load_config();
+        let loaded = load_config_for_env(&env);
         assert!(loaded.log_verbose);
         assert!(loaded.log_stderr);
     }
 
     #[test]
     fn log_config_values_apply_without_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"log":{"verbose":true,"stderr":true}}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let env = config_env(&config);
 
-        let loaded = load_config();
+        let loaded = load_config_for_env(&env);
         assert!(loaded.log_verbose);
         assert!(loaded.log_stderr);
     }
