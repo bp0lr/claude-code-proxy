@@ -8,6 +8,9 @@ description: Release notes for claude-code-proxy.
 - Optional Codex Images API routes reuse the existing ChatGPT OAuth session for
   `gpt-image-2` generation and JSON or multipart image edits, with strict size,
   concurrency, upstream-host, header, and diagnostic privacy boundaries.
+- Codex WebSocket connections honor `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+  and `NO_PROXY`, restoring standard non-TUN HTTP proxy support for both plain
+  WebSocket Upgrade requests and WSS CONNECT tunnels.
 
 - Grok handles images in user messages and tool results without failing requests.
   Images are omitted by default, with opt-in vision through
