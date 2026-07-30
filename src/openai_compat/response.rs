@@ -2,6 +2,10 @@ use serde_json::{Value, json};
 
 use super::{OpenAiError, OpenAiSurface};
 
+fn upstream_invalid(message: impl Into<String>, _param: Option<impl Into<String>>) -> OpenAiError {
+    OpenAiError::upstream_protocol(message)
+}
+
 #[derive(Debug, Clone)]
 pub struct SseEvent {
     pub event: Option<String>,
@@ -86,7 +90,7 @@ impl AnthropicAccumulator {
         match kind {
             "message_start" => {
                 let message = event.data.get("message").ok_or_else(|| {
-                    OpenAiError::invalid(
+                    upstream_invalid(
                         "Provider message_start is missing 'message'",
                         None::<String>,
                     )
@@ -104,7 +108,7 @@ impl AnthropicAccumulator {
             "content_block_start" => {
                 let index = required_index(&event.data)?;
                 let block = event.data.get("content_block").ok_or_else(|| {
-                    OpenAiError::invalid("Provider content block is missing", None::<String>)
+                    upstream_invalid("Provider content block is missing", None::<String>)
                 })?;
                 let kind = match block.get("type").and_then(Value::as_str) {
                     Some("text") => BlockKind::Text {
@@ -138,13 +142,13 @@ impl AnthropicAccumulator {
                     },
                     Some(kind) if kind.ends_with("_tool_result") => BlockKind::HostedResult,
                     Some(other) => {
-                        return Err(OpenAiError::invalid(
+                        return Err(upstream_invalid(
                             format!("Unsupported provider output block '{other}'"),
                             None::<String>,
                         ));
                     }
                     None => {
-                        return Err(OpenAiError::invalid(
+                        return Err(upstream_invalid(
                             "Provider output block has no type",
                             None::<String>,
                         ));
@@ -155,7 +159,7 @@ impl AnthropicAccumulator {
             "content_block_delta" => {
                 let index = required_index(&event.data)?;
                 let delta = event.data.get("delta").ok_or_else(|| {
-                    OpenAiError::invalid("Provider content delta is missing", None::<String>)
+                    upstream_invalid("Provider content delta is missing", None::<String>)
                 })?;
                 let block = self
                     .blocks
@@ -163,7 +167,7 @@ impl AnthropicAccumulator {
                     .rev()
                     .find(|block| block.index == index)
                     .ok_or_else(|| {
-                        OpenAiError::invalid(
+                        upstream_invalid(
                             "Provider delta references an unknown block",
                             None::<String>,
                         )
@@ -200,18 +204,36 @@ impl AnthropicAccumulator {
                     }
                     (Some("citations_delta"), BlockKind::Text { .. }) => {
                         if let Some(citation) = delta.get("citation") {
-                            self.citations.push(openai_citation(citation));
+                            self.citations.push(citation.clone());
                         }
                     }
                     _ => {
-                        return Err(OpenAiError::invalid(
+                        return Err(upstream_invalid(
                             "Provider delta does not match its content block",
                             None::<String>,
                         ));
                     }
                 }
             }
-            "content_block_stop" => {}
+            "content_block_stop" => {
+                let index = required_index(&event.data)?;
+                if let Some(arguments) = self.blocks.iter().find_map(|block| {
+                    if block.index != index {
+                        return None;
+                    }
+                    match &block.kind {
+                        BlockKind::Tool { arguments, .. }
+                        | BlockKind::HostedSearch { arguments, .. } => Some(arguments),
+                        _ => None,
+                    }
+                }) && !arguments.is_empty()
+                    && serde_json::from_str::<Value>(arguments).is_err()
+                {
+                    return Err(OpenAiError::upstream_protocol(
+                        "Provider emitted malformed tool arguments",
+                    ));
+                }
+            }
             "message_delta" => {
                 self.stop_reason = event
                     .data
@@ -243,7 +265,7 @@ impl AnthropicAccumulator {
                 });
             }
             other if !other.is_empty() => {
-                return Err(OpenAiError::invalid(
+                return Err(upstream_invalid(
                     format!("Unsupported provider stream event '{other}'"),
                     None::<String>,
                 ));
@@ -285,7 +307,7 @@ pub fn buffered_response(
         state.apply(event)?;
     }
     if !state.stopped {
-        return Err(OpenAiError::invalid(
+        return Err(upstream_invalid(
             "Provider stream ended before message_stop",
             None::<String>,
         ));
@@ -355,7 +377,7 @@ pub fn chat_response(
     if !state.citations.is_empty() {
         message.insert(
             "annotations".to_string(),
-            Value::Array(state.citations.clone()),
+            Value::Array(state.citations.iter().map(chat_citation).collect()),
         );
     }
     json!({
@@ -380,47 +402,31 @@ pub fn responses_response(
     created: u64,
 ) -> Value {
     let mut output = Vec::new();
-    let reasoning = state
+    for block in state
         .blocks
         .iter()
-        .filter_map(|block| match &block.kind {
-            BlockKind::Thinking { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<String>();
-    if !reasoning.is_empty() {
-        output.push(json!({
-            "id":format!("rs_{}", stable_suffix(response_id, 0)),
-            "type":"reasoning",
-            "summary":[{"type":"summary_text", "text":reasoning}],
-            "status":"completed",
-        }));
-    }
-    let text = state
-        .blocks
-        .iter()
-        .filter_map(|block| match &block.kind {
-            BlockKind::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<String>();
-    if !text.is_empty() {
-        output.push(json!({
-            "id":format!("msg_{}", stable_suffix(response_id, 1)),
-            "type":"message",
-            "role":"assistant",
-            "status":"completed",
-            "content":[{"type":"output_text", "text":text, "annotations":state.citations}],
-        }));
-    }
-    for (index, block) in state.blocks.iter().enumerate() {
+        .filter(|block| !matches!(block.kind, BlockKind::HostedResult))
+    {
         match &block.kind {
+            BlockKind::Text { text } => output.push(json!({
+                "id":format!("msg_{}", stable_suffix(response_id, block.index)),
+                "type":"message",
+                "role":"assistant",
+                "status":"completed",
+                "content":[{"type":"output_text", "text":text, "annotations":state.citations.iter().map(responses_citation).collect::<Vec<_>>() }],
+            })),
+            BlockKind::Thinking { text } => output.push(json!({
+                "id":format!("rs_{}", stable_suffix(response_id, block.index)),
+                "type":"reasoning",
+                "summary":[{"type":"summary_text", "text":text}],
+                "status":"completed",
+            })),
             BlockKind::Tool {
                 id,
                 name,
                 arguments,
             } => output.push(json!({
-                "id":format!("fc_{}", stable_suffix(response_id, index + 2)),
+                "id":format!("fc_{}", stable_suffix(response_id, block.index)),
                 "type":"function_call",
                 "call_id":id,
                 "name":name,
@@ -437,19 +443,20 @@ pub fn responses_response(
                 "status":"completed",
                 "action":hosted_search_action(name, arguments),
             })),
-            _ => {}
+            BlockKind::HostedResult => unreachable!(),
         }
     }
+    let incomplete = state.stop_reason.as_deref() == Some("max_tokens");
     json!({
         "id":response_id,
         "object":"response",
         "created_at":created,
-        "status":"completed",
+        "status":if incomplete { "incomplete" } else { "completed" },
         "model":model,
         "output":output,
         "parallel_tool_calls":false,
         "error":null,
-        "incomplete_details":null,
+        "incomplete_details":if incomplete { json!({"reason":"max_output_tokens"}) } else { Value::Null },
         "usage":state.usage.responses_value(),
     })
 }
@@ -475,25 +482,33 @@ pub fn hosted_search_action(_name: &str, arguments: &str) -> Value {
     json!({"type":"search", "query":query})
 }
 
-fn openai_citation(citation: &Value) -> Value {
+pub fn chat_citation(citation: &Value) -> Value {
     json!({
         "type":"url_citation",
         "url_citation":{
             "url":citation.get("url").and_then(Value::as_str).unwrap_or_default(),
             "title":citation.get("title").and_then(Value::as_str).unwrap_or_default(),
-            "start_index":0,
-            "end_index":0,
+            "start_index":citation.get("start_index").and_then(Value::as_u64).unwrap_or_default(),
+            "end_index":citation.get("end_index").and_then(Value::as_u64).unwrap_or_default(),
         }
+    })
+}
+
+pub fn responses_citation(citation: &Value) -> Value {
+    json!({
+        "type":"url_citation",
+        "url":citation.get("url").and_then(Value::as_str).unwrap_or_default(),
+        "title":citation.get("title").and_then(Value::as_str).unwrap_or_default(),
+        "start_index":citation.get("start_index").and_then(Value::as_u64).unwrap_or_default(),
+        "end_index":citation.get("end_index").and_then(Value::as_u64).unwrap_or_default(),
     })
 }
 
 pub fn normalized_arguments(arguments: &str) -> String {
     if arguments.is_empty() {
         "{}".to_string()
-    } else if serde_json::from_str::<Value>(arguments).is_ok() {
-        arguments.to_string()
     } else {
-        json!({"value":arguments}).to_string()
+        arguments.to_string()
     }
 }
 
@@ -506,7 +521,7 @@ fn required_index(value: &Value) -> Result<usize, OpenAiError> {
         .get("index")
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
-        .ok_or_else(|| OpenAiError::invalid("Provider event has an invalid index", None::<String>))
+        .ok_or_else(|| upstream_invalid("Provider event has an invalid index", None::<String>))
 }
 
 fn required_block_string(block: &Value, key: &str) -> Result<String, OpenAiError> {
@@ -516,7 +531,7 @@ fn required_block_string(block: &Value, key: &str) -> Result<String, OpenAiError
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or_else(|| {
-            OpenAiError::invalid(
+            upstream_invalid(
                 format!("Provider tool block has an invalid '{key}'"),
                 None::<String>,
             )

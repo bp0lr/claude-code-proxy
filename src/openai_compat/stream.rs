@@ -19,10 +19,15 @@ use crate::{
 use super::{
     MAX_PROVIDER_STREAM_BYTES, MAX_SSE_EVENT_BYTES, OpenAiError, OpenAiSurface,
     response::{
-        AnthropicAccumulator, BlockKind, SseEvent, buffered_response, chat_finish_reason,
-        hosted_search_action, normalized_arguments, responses_response,
+        AnthropicAccumulator, BlockKind, SseEvent, buffered_response, chat_citation,
+        chat_finish_reason, hosted_search_action, normalized_arguments, responses_citation,
+        responses_response,
     },
 };
+
+fn upstream_invalid(message: impl Into<String>, _param: Option<impl Into<String>>) -> OpenAiError {
+    OpenAiError::upstream_protocol(message)
+}
 
 #[derive(Default)]
 pub struct SseDecoder {
@@ -32,19 +37,23 @@ pub struct SseDecoder {
 impl SseDecoder {
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, OpenAiError> {
         self.pending.extend_from_slice(bytes);
-        if self.pending.len() > MAX_SSE_EVENT_BYTES {
-            return Err(OpenAiError::invalid(
-                "Provider SSE event exceeded the size limit",
-                None::<String>,
-            ));
-        }
         let mut events = Vec::new();
         while let Some((position, delimiter_len)) = find_event_delimiter(&self.pending) {
+            if position > MAX_SSE_EVENT_BYTES {
+                return Err(OpenAiError::upstream_protocol(
+                    "Provider SSE event exceeded the size limit",
+                ));
+            }
             let frame = self.pending.split_to(position + delimiter_len);
             let payload = &frame[..position];
             if let Some(event) = parse_frame(payload)? {
                 events.push(event);
             }
+        }
+        if self.pending.len() > MAX_SSE_EVENT_BYTES {
+            return Err(OpenAiError::upstream_protocol(
+                "Provider SSE event exceeded the size limit",
+            ));
         }
         Ok(events)
     }
@@ -53,9 +62,8 @@ impl SseDecoder {
         if self.pending.iter().all(u8::is_ascii_whitespace) {
             Ok(())
         } else {
-            Err(OpenAiError::invalid(
+            Err(OpenAiError::upstream_protocol(
                 "Provider SSE stream ended with an incomplete event",
-                None::<String>,
             ))
         }
     }
@@ -66,9 +74,9 @@ pub async fn openai_response(
     generation: Generation,
     stream: bool,
     include_usage: bool,
-    model: String,
     traffic: Option<Arc<TrafficCapture>>,
 ) -> Result<Response, OpenAiError> {
+    let model = generation.resolved_model.clone();
     let response_id = match surface {
         OpenAiSurface::ChatCompletions => format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
         OpenAiSurface::Responses => format!("resp_{}", uuid::Uuid::new_v4().simple()),
@@ -98,9 +106,8 @@ async fn collect_generation(body: GenerationBody) -> Result<Bytes, OpenAiError> 
     match body {
         GenerationBody::BufferedSse(bytes) => {
             if bytes.len() > MAX_PROVIDER_STREAM_BYTES {
-                Err(OpenAiError::invalid(
+                Err(OpenAiError::upstream_protocol(
                     "Provider response exceeded the size limit",
-                    None::<String>,
                 ))
             } else {
                 Ok(bytes)
@@ -119,9 +126,8 @@ async fn collect_generation(body: GenerationBody) -> Result<Bytes, OpenAiError> 
                 })?;
                 if let Ok(data) = frame.into_data() {
                     if output.len().saturating_add(data.len()) > MAX_PROVIDER_STREAM_BYTES {
-                        return Err(OpenAiError::invalid(
+                        return Err(OpenAiError::upstream_protocol(
                             "Provider response exceeded the size limit",
-                            None::<String>,
                         ));
                     }
                     output.extend_from_slice(&data);
@@ -221,9 +227,8 @@ impl StreamState {
                     };
                     self.bytes = self.bytes.saturating_add(data.len());
                     if self.bytes > MAX_PROVIDER_STREAM_BYTES {
-                        self.fail(OpenAiError::invalid(
+                        self.fail(OpenAiError::upstream_protocol(
                             "Provider response exceeded the size limit",
-                            None::<String>,
                         ));
                         continue;
                     }
@@ -254,7 +259,7 @@ impl StreamState {
                     if let Err(error) = self.decoder.finish() {
                         self.fail(error);
                     } else if !self.renderer.state.stopped {
-                        self.fail(OpenAiError::invalid(
+                        self.fail(upstream_invalid(
                             "Provider stream ended before message_stop",
                             None::<String>,
                         ));
@@ -267,9 +272,10 @@ impl StreamState {
     }
 
     fn capture_bytes(&mut self, bytes: &[u8]) {
-        if self.downstream.len().saturating_add(bytes.len()) <= MAX_SSE_CAPTURE_BYTES {
-            self.downstream.extend_from_slice(bytes);
-        } else {
+        let remaining = MAX_SSE_CAPTURE_BYTES.saturating_sub(self.downstream.len());
+        self.downstream
+            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        if bytes.len() > remaining {
             self.downstream_truncated = true;
         }
     }
@@ -315,7 +321,6 @@ struct Renderer {
     created: u64,
     sequence: u64,
     state: AnthropicAccumulator,
-    responses_message_started: bool,
 }
 
 impl Renderer {
@@ -334,7 +339,6 @@ impl Renderer {
             created,
             sequence: 0,
             state: AnthropicAccumulator::default(),
-            responses_message_started: false,
         }
     }
 
@@ -366,12 +370,13 @@ impl Renderer {
                 if let Some(block) = self.state.blocks.iter().rev().find(|block| block.index == index as usize)
                     && let BlockKind::Tool { id, name, .. } = &block.kind
                 {
+                    let tool_index = self.tool_index(index as usize);
                     out.push(chat_data(json!({
                         "id":self.response_id,
                         "object":"chat.completion.chunk",
                         "created":self.created,
                         "model":self.model,
-                        "choices":[{"index":0,"delta":{"tool_calls":[{"index":index,"id":id,"type":"function","function":{"name":name,"arguments":""}}]},"finish_reason":null,"logprobs":null}],
+                        "choices":[{"index":0,"delta":{"tool_calls":[{"index":tool_index,"id":id,"type":"function","function":{"name":name,"arguments":""}}]},"finish_reason":null,"logprobs":null}],
                     })));
                 }
             }
@@ -386,14 +391,15 @@ impl Renderer {
                             block.index == index as usize
                                 && matches!(block.kind, BlockKind::Tool { .. })
                         }) {
-                            json!({"tool_calls":[{"index":index,"function":{"arguments":delta.get("partial_json").and_then(Value::as_str).unwrap_or_default()}}]})
+                            let tool_index = self.tool_index(index as usize);
+                            json!({"tool_calls":[{"index":tool_index,"function":{"arguments":delta.get("partial_json").and_then(Value::as_str).unwrap_or_default()}}]})
                         } else {
                             return Ok(out);
                         }
                     }
-                    Some("citations_delta") => json!({"annotations":self.state.citations.last().cloned().into_iter().collect::<Vec<_>>()}),
+                    Some("citations_delta") => json!({"annotations":self.state.citations.iter().map(responses_citation).collect::<Vec<_>>().last().map(chat_citation).into_iter().collect::<Vec<_>>()}),
                     Some("signature_delta") => return Ok(out),
-                    _ => return Err(OpenAiError::invalid("Unsupported provider content delta", None::<String>)),
+                    _ => return Err(upstream_invalid("Unsupported provider content delta", None::<String>)),
                 };
                 out.push(chat_data(json!({
                     "id":self.response_id,
@@ -444,6 +450,7 @@ impl Renderer {
                     .get("index")
                     .and_then(Value::as_u64)
                     .unwrap_or_default() as usize;
+                let output_index = self.output_index(index);
                 let block = self
                     .state
                     .blocks
@@ -452,33 +459,36 @@ impl Renderer {
                     .find(|block| block.index == index)
                     .cloned()
                     .ok_or_else(|| {
-                        OpenAiError::invalid("Provider content block is missing", None::<String>)
+                        upstream_invalid("Provider content block is missing", None::<String>)
                     })?;
                 match &block.kind {
                     BlockKind::Text { .. } => {
-                        let item_id = self.message_item_id();
-                        if !self.responses_message_started {
-                            out.push(self.responses_event("response.output_item.added", json!({
-                                "output_index":index,
-                                "item":{"id":item_id,"type":"message","role":"assistant","status":"in_progress","content":[]},
-                            })));
-                            self.responses_message_started = true;
-                        }
+                        let item_id = self.message_item_id(index);
+                        out.push(self.responses_event("response.output_item.added", json!({
+                            "output_index":output_index,
+                            "item":{"id":item_id,"type":"message","role":"assistant","status":"in_progress","content":[]},
+                        })));
                         out.push(self.responses_event("response.content_part.added", json!({
-                            "item_id":item_id,"output_index":index,"content_index":0,
+                            "item_id":item_id,"output_index":output_index,"content_index":0,
                             "part":{"type":"output_text","text":"","annotations":[]},
                         })));
                     }
-                    BlockKind::Thinking { .. } => out.push(self.responses_event("response.output_item.added", json!({
-                        "output_index":index,
-                        "item":{"id":self.block_item_id("rs", index),"type":"reasoning","status":"in_progress","summary":[]},
-                    }))),
+                    BlockKind::Thinking { .. } => {
+                        out.push(self.responses_event("response.output_item.added", json!({
+                            "output_index":output_index,
+                            "item":{"id":self.block_item_id("rs", index),"type":"reasoning","status":"in_progress","summary":[]},
+                        })));
+                        out.push(self.responses_event("response.reasoning_summary_part.added", json!({
+                            "item_id":self.block_item_id("rs", index),"output_index":output_index,"summary_index":0,
+                            "part":{"type":"summary_text","text":""},
+                        })));
+                    }
                     BlockKind::Tool { id, name, .. } => out.push(self.responses_event("response.output_item.added", json!({
-                        "output_index":index,
+                        "output_index":output_index,
                         "item":{"id":self.block_item_id("fc", index),"type":"function_call","call_id":id,"name":name,"arguments":"","status":"in_progress"},
                     }))),
                     BlockKind::HostedSearch { id, .. } => out.push(self.responses_event("response.output_item.added", json!({
-                        "output_index":index,
+                        "output_index":output_index,
                         "item":{"id":id,"type":"web_search_call","status":"in_progress"},
                     }))),
                     BlockKind::HostedResult => {}
@@ -490,14 +500,15 @@ impl Renderer {
                     .get("index")
                     .and_then(Value::as_u64)
                     .unwrap_or_default() as usize;
+                let output_index = self.output_index(index);
                 let delta = event.data.get("delta").unwrap_or(&Value::Null);
                 match delta.get("type").and_then(Value::as_str) {
                     Some("text_delta") => out.push(self.responses_event("response.output_text.delta", json!({
-                        "item_id":self.message_item_id(),"output_index":index,"content_index":0,
+                        "item_id":self.message_item_id(index),"output_index":output_index,"content_index":0,
                         "delta":delta.get("text").and_then(Value::as_str).unwrap_or_default(),"logprobs":[],
                     }))),
                     Some("thinking_delta") => out.push(self.responses_event("response.reasoning_summary_text.delta", json!({
-                        "item_id":self.block_item_id("rs", index),"output_index":index,"summary_index":0,
+                        "item_id":self.block_item_id("rs", index),"output_index":output_index,"summary_index":0,
                         "delta":delta.get("thinking").and_then(Value::as_str).unwrap_or_default(),
                     }))),
                     Some("input_json_delta") => {
@@ -505,18 +516,18 @@ impl Renderer {
                             block.index == index && matches!(block.kind, BlockKind::Tool { .. })
                         }) {
                             out.push(self.responses_event("response.function_call_arguments.delta", json!({
-                                "item_id":self.block_item_id("fc", index),"output_index":index,
+                                "item_id":self.block_item_id("fc", index),"output_index":output_index,
                                 "delta":delta.get("partial_json").and_then(Value::as_str).unwrap_or_default(),
                             })));
                         }
                     }
                     Some("citations_delta") => out.push(self.responses_event("response.output_text.annotation.added", json!({
-                        "item_id":self.message_item_id(),"output_index":index,"content_index":0,
+                        "item_id":self.message_item_id(index),"output_index":output_index,"content_index":0,
                         "annotation_index":self.state.citations.len().saturating_sub(1),
-                        "annotation":self.state.citations.last().cloned().unwrap_or(Value::Null),
+                        "annotation":self.state.citations.last().map(responses_citation).unwrap_or(Value::Null),
                     }))),
                     Some("signature_delta") => {}
-                    _ => return Err(OpenAiError::invalid("Unsupported provider content delta", None::<String>)),
+                    _ => return Err(upstream_invalid("Unsupported provider content delta", None::<String>)),
                 }
             }
             "content_block_stop" => {
@@ -525,6 +536,7 @@ impl Renderer {
                     .get("index")
                     .and_then(Value::as_u64)
                     .unwrap_or_default() as usize;
+                let output_index = self.output_index(index);
                 let block = self
                     .state
                     .blocks
@@ -533,28 +545,32 @@ impl Renderer {
                     .find(|block| block.index == index)
                     .cloned()
                     .ok_or_else(|| {
-                        OpenAiError::invalid("Provider content block is missing", None::<String>)
+                        upstream_invalid("Provider content block is missing", None::<String>)
                     })?;
                 match block.kind {
                     BlockKind::Text { text } => {
                         out.push(self.responses_event("response.output_text.done", json!({
-                            "item_id":self.message_item_id(),"output_index":index,"content_index":0,"text":text,"logprobs":[],
+                            "item_id":self.message_item_id(index),"output_index":output_index,"content_index":0,"text":text,"logprobs":[],
                         })));
                         out.push(self.responses_event("response.content_part.done", json!({
-                            "item_id":self.message_item_id(),"output_index":index,"content_index":0,
-                            "part":{"type":"output_text","text":text,"annotations":self.state.citations},
+                            "item_id":self.message_item_id(index),"output_index":output_index,"content_index":0,
+                            "part":{"type":"output_text","text":text,"annotations":self.state.citations.iter().map(responses_citation).collect::<Vec<_>>()},
                         })));
                         out.push(self.responses_event("response.output_item.done", json!({
-                            "output_index":index,
-                            "item":{"id":self.message_item_id(),"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":self.state.citations}]},
+                            "output_index":output_index,
+                            "item":{"id":self.message_item_id(index),"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":self.state.citations.iter().map(responses_citation).collect::<Vec<_>>()}]},
                         })));
                     }
                     BlockKind::Thinking { text } => {
                         out.push(self.responses_event("response.reasoning_summary_text.done", json!({
-                            "item_id":self.block_item_id("rs", index),"output_index":index,"summary_index":0,"text":text,
+                            "item_id":self.block_item_id("rs", index),"output_index":output_index,"summary_index":0,"text":text,
+                        })));
+                        out.push(self.responses_event("response.reasoning_summary_part.done", json!({
+                            "item_id":self.block_item_id("rs", index),"output_index":output_index,"summary_index":0,
+                            "part":{"type":"summary_text","text":text},
                         })));
                         out.push(self.responses_event("response.output_item.done", json!({
-                            "output_index":index,
+                            "output_index":output_index,
                             "item":{"id":self.block_item_id("rs", index),"type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":text}]},
                         })));
                     }
@@ -565,10 +581,10 @@ impl Renderer {
                     } => {
                         let arguments = normalized_arguments(&arguments);
                         out.push(self.responses_event("response.function_call_arguments.done", json!({
-                            "item_id":self.block_item_id("fc", index),"output_index":index,"arguments":arguments,
+                            "item_id":self.block_item_id("fc", index),"output_index":output_index,"arguments":arguments,
                         })));
                         out.push(self.responses_event("response.output_item.done", json!({
-                            "output_index":index,
+                            "output_index":output_index,
                             "item":{"id":self.block_item_id("fc", index),"type":"function_call","call_id":id,"name":name,"arguments":arguments,"status":"completed"},
                         })));
                     }
@@ -577,7 +593,7 @@ impl Renderer {
                         name,
                         arguments,
                     } => out.push(self.responses_event("response.output_item.done", json!({
-                        "output_index":index,
+                        "output_index":output_index,
                         "item":{"id":id,"type":"web_search_call","status":"completed","action":hosted_search_action(&name, &arguments)},
                     }))),
                     BlockKind::HostedResult => {}
@@ -586,7 +602,12 @@ impl Renderer {
             "message_stop" => {
                 let response =
                     responses_response(&self.state, &self.response_id, &self.model, self.created);
-                out.push(self.responses_event("response.completed", json!({"response":response})));
+                let kind = if self.state.stop_reason.as_deref() == Some("max_tokens") {
+                    "response.incomplete"
+                } else {
+                    "response.completed"
+                };
+                out.push(self.responses_event(kind, json!({"response":response})));
             }
             _ => {}
         }
@@ -595,9 +616,12 @@ impl Renderer {
 
     fn failure(&mut self, error: &OpenAiError) -> Vec<Bytes> {
         match self.surface {
-            OpenAiSurface::ChatCompletions => vec![chat_data(json!({
-                "error":{"message":error.message,"type":error.kind,"param":error.param,"code":error.code}
-            }))],
+            OpenAiSurface::ChatCompletions => vec![
+                chat_data(json!({
+                    "error":{"message":error.message,"type":error.kind,"param":error.param,"code":error.code}
+                })),
+                Bytes::from_static(b"data: [DONE]\n\n"),
+            ],
             OpenAiSurface::Responses => {
                 let mut response =
                     response_shell(&self.response_id, &self.model, self.created, "failed");
@@ -616,8 +640,28 @@ impl Renderer {
         named_sse(kind, Value::Object(value))
     }
 
-    fn message_item_id(&self) -> String {
-        format!("msg_{}", self.response_id.trim_start_matches("resp_"))
+    fn message_item_id(&self, block_index: usize) -> String {
+        self.block_item_id("msg", block_index)
+    }
+
+    fn output_index(&self, block_index: usize) -> usize {
+        self.state
+            .blocks
+            .iter()
+            .filter(|block| {
+                block.index < block_index && !matches!(block.kind, BlockKind::HostedResult)
+            })
+            .count()
+    }
+
+    fn tool_index(&self, block_index: usize) -> usize {
+        self.state
+            .blocks
+            .iter()
+            .filter(|block| {
+                block.index < block_index && matches!(block.kind, BlockKind::Tool { .. })
+            })
+            .count()
     }
 
     fn block_item_id(&self, prefix: &str, index: usize) -> String {
@@ -653,7 +697,7 @@ fn response_shell(id: &str, model: &str, created: u64, status: &str) -> Value {
 
 fn parse_frame(frame: &[u8]) -> Result<Option<SseEvent>, OpenAiError> {
     let text = std::str::from_utf8(frame)
-        .map_err(|_| OpenAiError::invalid("Provider SSE event is not UTF-8", None::<String>))?;
+        .map_err(|_| OpenAiError::upstream_protocol("Provider SSE event is not UTF-8"))?;
     let mut event = None;
     let mut data = Vec::new();
     for line in text.lines() {
@@ -675,10 +719,7 @@ fn parse_frame(frame: &[u8]) -> Result<Option<SseEvent>, OpenAiError> {
         return Ok(None);
     }
     let data = serde_json::from_str(&data).map_err(|error| {
-        OpenAiError::invalid(
-            format!("Provider SSE event contains invalid JSON: {error}"),
-            None::<String>,
-        )
+        OpenAiError::upstream_protocol(format!("Provider SSE event contains invalid JSON: {error}"))
     })?;
     Ok(Some(SseEvent { event, data }))
 }
@@ -723,6 +764,16 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event.as_deref(), Some("message_start"));
+        decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn decoder_accepts_large_batches_of_small_events() {
+        let event = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+        let count = MAX_SSE_EVENT_BYTES / event.len() + 1;
+        let mut decoder = SseDecoder::default();
+        let events = decoder.push(event.repeat(count).as_bytes()).unwrap();
+        assert_eq!(events.len(), count);
         decoder.finish().unwrap();
     }
 

@@ -52,6 +52,17 @@ impl OpenAiError {
         }
     }
 
+    pub fn upstream_protocol(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            kind: "api_error".into(),
+            message: message.into().into_boxed_str(),
+            param: None,
+            code: Some("upstream_protocol_error".into()),
+            retry_after: None,
+        }
+    }
+
     pub fn unsupported(param: impl Into<String>) -> Self {
         let param = param.into();
         Self {

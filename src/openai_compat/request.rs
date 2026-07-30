@@ -114,11 +114,12 @@ pub fn parse_request(
     }
     validate_single_choice(object)?;
     validate_parallel_tools(object)?;
+    validate_store(surface, object)?;
     let max_tokens = parse_max_tokens(surface, object)?;
     let tools = parse_tools(object.get("tools"), surface)?;
     let tool_choice = parse_tool_choice(object.get("tool_choice"), &tools, surface)?;
     let effort = parse_effort(surface, object)?;
-    validate_cursor(provider, session_id, &messages, &tools)?;
+    validate_cursor(provider, session_id, stream, &messages, &tools)?;
 
     let mut extra = Map::new();
     if !system.is_empty() {
@@ -177,6 +178,20 @@ fn optional_bool(
         Some(_) => Err(OpenAiError::invalid(
             format!("'{key}' must be a boolean"),
             Some(key),
+        )),
+    }
+}
+
+fn validate_store(surface: OpenAiSurface, object: &Map<String, Value>) -> Result<(), OpenAiError> {
+    if surface != OpenAiSurface::Responses {
+        return Ok(());
+    }
+    match object.get("store") {
+        None | Some(Value::Null | Value::Bool(false)) => Ok(()),
+        Some(Value::Bool(true)) => Err(OpenAiError::unsupported("store")),
+        Some(_) => Err(OpenAiError::invalid(
+            "'store' must be a boolean",
+            Some("store"),
         )),
     }
 }
@@ -282,7 +297,10 @@ fn parse_effort(
     let effort = value.as_str().ok_or_else(|| {
         OpenAiError::invalid(
             "Reasoning effort must be a string",
-            Some("reasoning_effort"),
+            Some(match surface {
+                OpenAiSurface::ChatCompletions => "reasoning_effort",
+                OpenAiSurface::Responses => "reasoning.effort",
+            }),
         )
     })?;
     match effort {
@@ -366,7 +384,7 @@ fn parse_chat_messages(value: Option<&Value>) -> Result<(Vec<Message>, Vec<Strin
             }
             "tool" => {
                 let id = required_string(object, "tool_call_id", &format!("{param}.tool_call_id"))?;
-                if !calls.contains(&id) {
+                if !calls.remove(&id) {
                     return Err(OpenAiError::invalid(
                         format!("Tool result references unknown call '{id}'"),
                         Some(format!("{param}.tool_call_id")),
@@ -502,7 +520,7 @@ fn parse_responses_input(
                     &param,
                 )?;
                 let id = required_string(object, "call_id", &format!("{param}.call_id"))?;
-                if !calls.contains(&id) {
+                if !calls.remove(&id) {
                     return Err(OpenAiError::invalid(
                         format!("Function output references unknown call '{id}'"),
                         Some(format!("{param}.call_id")),
@@ -789,7 +807,8 @@ fn append_text_blocks(
 ) -> Result<(), OpenAiError> {
     match value {
         None | Some(Value::Null) => Ok(()),
-        Some(Value::String(text)) if !text.is_empty() => {
+        Some(Value::String(text)) if text.is_empty() => Ok(()),
+        Some(Value::String(text)) => {
             out.push(json!({"type":"text", "text":text}));
             Ok(())
         }
@@ -892,6 +911,7 @@ fn image_url_block(url: &str, param: &str) -> Result<Value, OpenAiError> {
         if encoded.len() > MAX_IMAGE_DATA_BYTES * 4 / 3 + 4 {
             return Err(OpenAiError::invalid("Image data is too large", Some(param)));
         }
+        let media_type = media_type.split(';').next().unwrap_or(media_type);
         if !matches!(
             media_type,
             "image/png" | "image/jpeg" | "image/gif" | "image/webp"
@@ -918,6 +938,7 @@ fn image_url_block(url: &str, param: &str) -> Result<Value, OpenAiError> {
 fn validate_cursor(
     provider: &str,
     session_id: Option<&str>,
+    stream: bool,
     messages: &[Message],
     tools: &[Value],
 ) -> Result<(), OpenAiError> {
@@ -934,6 +955,12 @@ fn validate_cursor(
     }
     if tools.is_empty() {
         return Ok(());
+    }
+    if !stream {
+        return Err(OpenAiError::invalid(
+            "Cursor tools require 'stream' to be true",
+            Some("stream"),
+        ));
     }
     if session_id.is_none_or(str::is_empty) {
         return Err(OpenAiError::invalid(
@@ -1129,6 +1156,7 @@ mod tests {
             OpenAiSurface::ChatCompletions,
             json!({
                 "model":"cursor:gpt-5.5",
+                "stream":true,
                 "messages":[{"role":"user","content":"x"}],
                 "tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]
             }),
@@ -1137,6 +1165,47 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.param.as_deref(), Some("tools"));
+    }
+
+    #[test]
+    fn rejects_duplicate_results_store_and_buffered_cursor_tools() {
+        let duplicate = parse_request(
+            OpenAiSurface::ChatCompletions,
+            json!({
+                "model":"kimi-k2.6",
+                "messages":[
+                    {"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+                    {"role":"tool","tool_call_id":"call_1","content":"first"},
+                    {"role":"tool","tool_call_id":"call_1","content":"second"}
+                ]
+            }),
+            "kimi",
+            Some("session"),
+        )
+        .unwrap_err();
+        assert!(duplicate.message.contains("unknown call"));
+
+        let store = parse_request(
+            OpenAiSurface::Responses,
+            json!({"model":"grok-4.5","input":"hello","store":true}),
+            "grok",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(store.param.as_deref(), Some("store"));
+
+        let cursor = parse_request(
+            OpenAiSurface::ChatCompletions,
+            json!({
+                "model":"cursor:gpt-5.5",
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]
+            }),
+            "cursor",
+            Some("session"),
+        )
+        .unwrap_err();
+        assert_eq!(cursor.param.as_deref(), Some("stream"));
     }
 
     #[test]

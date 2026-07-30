@@ -321,13 +321,13 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await {
         Ok(bytes) => bytes,
-        Err(error) => {
+        Err(_) => {
             let response = openai_error(
-                StatusCode::BAD_REQUEST,
+                StatusCode::PAYLOAD_TOO_LARGE,
                 "invalid_request_error",
-                format!("Invalid JSON: {error}"),
+                "Request body exceeded the size limit".to_string(),
                 None,
-                Some("invalid_json"),
+                Some("request_too_large"),
             );
             log_native_request_completed(
                 &log,
@@ -484,7 +484,6 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
                     generation,
                     parsed.stream,
                     parsed.include_usage,
-                    normalized_model.clone(),
                     traffic.clone(),
                 )
                 .await
@@ -553,13 +552,13 @@ async fn handler_chat_completions(
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await {
         Ok(bytes) => bytes,
-        Err(error) => {
+        Err(_) => {
             let response = openai_error(
-                StatusCode::BAD_REQUEST,
+                StatusCode::PAYLOAD_TOO_LARGE,
                 "invalid_request_error",
-                format!("Invalid JSON: {error}"),
+                "Request body exceeded the size limit".to_string(),
                 None,
-                Some("invalid_json"),
+                Some("request_too_large"),
             );
             log_native_request_completed(
                 &log,
@@ -736,7 +735,6 @@ async fn handler_chat_completions(
                     generation,
                     parsed.stream,
                     parsed.include_usage,
-                    normalized_model.clone(),
                     traffic.clone(),
                 )
                 .await
