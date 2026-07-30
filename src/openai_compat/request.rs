@@ -7,7 +7,7 @@ use crate::{
     registry::normalize_incoming_model,
 };
 
-use super::{OpenAiError, OpenAiSurface};
+use super::{OpenAiError, OpenAiResponseMetadata, OpenAiSurface};
 
 const MAX_MESSAGES: usize = 1_024;
 const MAX_TOOLS: usize = 128;
@@ -48,6 +48,7 @@ pub struct ParsedOpenAiRequest {
     pub normalized_model: String,
     pub stream: bool,
     pub include_usage: bool,
+    pub response_metadata: OpenAiResponseMetadata,
 }
 
 pub fn extract_model(body: &Value) -> Result<(String, String), OpenAiError> {
@@ -118,6 +119,22 @@ pub fn parse_request(
     let max_tokens = parse_max_tokens(surface, object)?;
     let tools = parse_tools(object.get("tools"), surface)?;
     let tool_choice = parse_tool_choice(object.get("tool_choice"), &tools, surface)?;
+    let response_metadata = if surface == OpenAiSurface::Responses {
+        OpenAiResponseMetadata {
+            tools: object
+                .get("tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            tool_choice: object
+                .get("tool_choice")
+                .filter(|value| !value.is_null())
+                .cloned()
+                .unwrap_or_else(|| json!("auto")),
+        }
+    } else {
+        OpenAiResponseMetadata::default()
+    };
     let effort = parse_effort(surface, object)?;
     validate_cursor(provider, session_id, stream, &messages, &tools)?;
 
@@ -156,6 +173,7 @@ pub fn parse_request(
         normalized_model,
         stream,
         include_usage,
+        response_metadata,
     })
 }
 

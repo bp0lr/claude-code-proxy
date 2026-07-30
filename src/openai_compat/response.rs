@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use super::{OpenAiError, OpenAiSurface};
+use super::{OpenAiError, OpenAiResponseMetadata, OpenAiSurface};
 
 fn upstream_invalid(message: impl Into<String>, _param: Option<impl Into<String>>) -> OpenAiError {
     OpenAiError::upstream_protocol(message)
@@ -301,6 +301,7 @@ pub fn buffered_response(
     response_id: &str,
     model: &str,
     created: u64,
+    response_metadata: &OpenAiResponseMetadata,
 ) -> Result<Value, OpenAiError> {
     let mut state = AnthropicAccumulator::default();
     for event in events {
@@ -314,7 +315,13 @@ pub fn buffered_response(
     }
     match surface {
         OpenAiSurface::ChatCompletions => Ok(chat_response(&state, response_id, model, created)),
-        OpenAiSurface::Responses => Ok(responses_response(&state, response_id, model, created)),
+        OpenAiSurface::Responses => Ok(responses_response(
+            &state,
+            response_id,
+            model,
+            created,
+            response_metadata,
+        )),
     }
 }
 
@@ -400,6 +407,7 @@ pub fn responses_response(
     response_id: &str,
     model: &str,
     created: u64,
+    response_metadata: &OpenAiResponseMetadata,
 ) -> Value {
     let mut output = Vec::new();
     for block in state
@@ -455,6 +463,8 @@ pub fn responses_response(
         "model":model,
         "output":output,
         "parallel_tool_calls":false,
+        "tool_choice":response_metadata.tool_choice,
+        "tools":response_metadata.tools,
         "error":null,
         "incomplete_details":if incomplete { json!({"reason":"max_output_tokens"}) } else { Value::Null },
         "usage":state.usage.responses_value(),
@@ -641,6 +651,7 @@ mod tests {
             "resp_test",
             "grok-4.5",
             1,
+            &OpenAiResponseMetadata::default(),
         )
         .unwrap();
         assert!(
@@ -670,6 +681,7 @@ mod tests {
             "chatcmpl_test",
             "kimi-k2.6",
             1,
+            &OpenAiResponseMetadata::default(),
         )
         .unwrap();
         assert_eq!(response["choices"][0]["message"]["content"], "hello");
@@ -689,6 +701,7 @@ mod tests {
             "resp_test",
             "kimi-k2.6",
             1,
+            &OpenAiResponseMetadata::default(),
         )
         .unwrap();
         assert_eq!(response["object"], "response");

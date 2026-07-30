@@ -7,7 +7,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::provider::{ProviderError, ProviderErrorKind};
 
@@ -26,6 +26,21 @@ impl OpenAiSurface {
         match self {
             Self::ChatCompletions => "chat_completions",
             Self::Responses => "responses",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenAiResponseMetadata {
+    pub tools: Vec<Value>,
+    pub tool_choice: Value,
+}
+
+impl Default for OpenAiResponseMetadata {
+    fn default() -> Self {
+        Self {
+            tools: Vec::new(),
+            tool_choice: json!("auto"),
         }
     }
 }

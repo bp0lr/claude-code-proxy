@@ -17,7 +17,8 @@ use crate::{
 };
 
 use super::{
-    MAX_PROVIDER_STREAM_BYTES, MAX_SSE_EVENT_BYTES, OpenAiError, OpenAiSurface,
+    MAX_PROVIDER_STREAM_BYTES, MAX_SSE_EVENT_BYTES, OpenAiError, OpenAiResponseMetadata,
+    OpenAiSurface,
     response::{
         AnthropicAccumulator, BlockKind, SseEvent, buffered_response, chat_citation,
         chat_finish_reason, hosted_search_action, normalized_arguments, responses_citation,
@@ -74,6 +75,7 @@ pub async fn openai_response(
     generation: Generation,
     stream: bool,
     include_usage: bool,
+    response_metadata: OpenAiResponseMetadata,
     traffic: Option<Arc<TrafficCapture>>,
 ) -> Result<Response, OpenAiError> {
     let model = generation.resolved_model.clone();
@@ -84,18 +86,28 @@ pub async fn openai_response(
     let created = current_seconds();
     if stream {
         return Ok(streaming_response(
-            surface,
             generation.body,
-            include_usage,
-            response_id,
-            model,
-            created,
+            Renderer::new(
+                surface,
+                include_usage,
+                response_id,
+                model,
+                created,
+                response_metadata,
+            ),
             traffic,
         ));
     }
     let bytes = collect_generation(generation.body).await?;
     let events = decode_all(&bytes)?;
-    let value = buffered_response(surface, &events, &response_id, &model, created)?;
+    let value = buffered_response(
+        surface,
+        &events,
+        &response_id,
+        &model,
+        created,
+        &response_metadata,
+    )?;
     if let Some(capture) = traffic.as_ref() {
         capture.write_json("071-openai-downstream-response", &value);
     }
@@ -146,12 +158,8 @@ fn decode_all(bytes: &[u8]) -> Result<Vec<SseEvent>, OpenAiError> {
 }
 
 fn streaming_response(
-    surface: OpenAiSurface,
     body: GenerationBody,
-    include_usage: bool,
-    response_id: String,
-    model: String,
-    created: u64,
+    renderer: Renderer,
     traffic: Option<Arc<TrafficCapture>>,
 ) -> Response {
     let outcome = NativeResponseOutcome::default();
@@ -161,7 +169,7 @@ fn streaming_response(
             GenerationBody::LiveSse(body) => body,
         },
         decoder: SseDecoder::default(),
-        renderer: Renderer::new(surface, include_usage, response_id, model, created),
+        renderer,
         pending: VecDeque::new(),
         finished: false,
         bytes: 0,
@@ -321,6 +329,7 @@ struct Renderer {
     created: u64,
     sequence: u64,
     state: AnthropicAccumulator,
+    response_metadata: OpenAiResponseMetadata,
 }
 
 impl Renderer {
@@ -330,6 +339,7 @@ impl Renderer {
         response_id: String,
         model: String,
         created: u64,
+        response_metadata: OpenAiResponseMetadata,
     ) -> Self {
         Self {
             surface,
@@ -339,6 +349,7 @@ impl Renderer {
             created,
             sequence: 0,
             state: AnthropicAccumulator::default(),
+            response_metadata,
         }
     }
 
@@ -437,8 +448,13 @@ impl Renderer {
         let mut out = Vec::new();
         match kind {
             "message_start" => {
-                let response =
-                    response_shell(&self.response_id, &self.model, self.created, "in_progress");
+                let response = response_shell(
+                    &self.response_id,
+                    &self.model,
+                    self.created,
+                    "in_progress",
+                    &self.response_metadata,
+                );
                 out.push(self.responses_event("response.created", json!({"response":response})));
                 out.push(
                     self.responses_event("response.in_progress", json!({"response":response})),
@@ -600,8 +616,13 @@ impl Renderer {
                 }
             }
             "message_stop" => {
-                let response =
-                    responses_response(&self.state, &self.response_id, &self.model, self.created);
+                let response = responses_response(
+                    &self.state,
+                    &self.response_id,
+                    &self.model,
+                    self.created,
+                    &self.response_metadata,
+                );
                 let kind = if self.state.stop_reason.as_deref() == Some("max_tokens") {
                     "response.incomplete"
                 } else {
@@ -623,8 +644,13 @@ impl Renderer {
                 Bytes::from_static(b"data: [DONE]\n\n"),
             ],
             OpenAiSurface::Responses => {
-                let mut response =
-                    response_shell(&self.response_id, &self.model, self.created, "failed");
+                let mut response = response_shell(
+                    &self.response_id,
+                    &self.model,
+                    self.created,
+                    "failed",
+                    &self.response_metadata,
+                );
                 response["error"] = json!({"code":error.code,"message":error.message});
                 vec![self.responses_event("response.failed", json!({"response":response}))]
             }
@@ -680,7 +706,13 @@ fn named_sse(kind: &str, value: Value) -> Bytes {
     Bytes::from(format!("event: {kind}\ndata: {value}\n\n"))
 }
 
-fn response_shell(id: &str, model: &str, created: u64, status: &str) -> Value {
+fn response_shell(
+    id: &str,
+    model: &str,
+    created: u64,
+    status: &str,
+    response_metadata: &OpenAiResponseMetadata,
+) -> Value {
     json!({
         "id":id,
         "object":"response",
@@ -689,6 +721,8 @@ fn response_shell(id: &str, model: &str, created: u64, status: &str) -> Value {
         "model":model,
         "output":[],
         "parallel_tool_calls":false,
+        "tool_choice":response_metadata.tool_choice,
+        "tools":response_metadata.tools,
         "error":null,
         "incomplete_details":null,
         "usage":null,
@@ -788,12 +822,15 @@ mod tests {
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         let response = streaming_response(
-            OpenAiSurface::ChatCompletions,
             GenerationBody::BufferedSse(Bytes::from_static(input.as_bytes())),
-            true,
-            "chatcmpl_test".into(),
-            "kimi-k2.6".into(),
-            1,
+            Renderer::new(
+                OpenAiSurface::ChatCompletions,
+                true,
+                "chatcmpl_test".into(),
+                "kimi-k2.6".into(),
+                1,
+                OpenAiResponseMetadata::default(),
+            ),
             None,
         );
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -815,12 +852,15 @@ mod tests {
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         let response = streaming_response(
-            OpenAiSurface::Responses,
             GenerationBody::BufferedSse(Bytes::from_static(input.as_bytes())),
-            false,
-            "resp_test".into(),
-            "grok-4.5".into(),
-            1,
+            Renderer::new(
+                OpenAiSurface::Responses,
+                false,
+                "resp_test".into(),
+                "grok-4.5".into(),
+                1,
+                OpenAiResponseMetadata::default(),
+            ),
             None,
         );
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
