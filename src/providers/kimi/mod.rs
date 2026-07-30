@@ -226,6 +226,12 @@ impl Provider for KimiProvider {
                 error.to_string(),
             )
         })?;
+        if let Some(traffic) = ctx.traffic.as_ref() {
+            traffic.write_json(
+                "020-upstream-request",
+                &serde_json::to_value(&translated).unwrap_or_default(),
+            );
+        }
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
@@ -244,6 +250,9 @@ impl Provider for KimiProvider {
             )
         })?
         .map_err(kimi_provider_error)?;
+        if let Some(traffic) = ctx.traffic.as_ref() {
+            traffic.write_bytes("032-upstream-response-body.sse", &upstream.body);
+        }
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         let sse =
             translate_stream_bytes(&upstream.body, &message_id, &requested).map_err(|error| {
@@ -253,6 +262,9 @@ impl Provider for KimiProvider {
                     format!("Stream translation error: {error}"),
                 )
             })?;
+        if let Some(traffic) = ctx.traffic.as_ref() {
+            traffic.write_bytes("050-anthropic-intermediate.sse", &sse);
+        }
         if let Some(monitor) = ctx.monitor.as_ref() {
             let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse);
             monitor.stream_progress(

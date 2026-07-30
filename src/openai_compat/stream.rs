@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, convert::Infallible};
+use std::{collections::VecDeque, convert::Infallible, sync::Arc};
 
 use axum::{
     Json,
@@ -13,13 +13,14 @@ use serde_json::{Value, json};
 use crate::{
     provider::{Generation, GenerationBody},
     providers::codex::native::NativeResponseOutcome,
+    traffic::{MAX_SSE_CAPTURE_BYTES, TrafficCapture},
 };
 
 use super::{
     MAX_PROVIDER_STREAM_BYTES, MAX_SSE_EVENT_BYTES, OpenAiError, OpenAiSurface,
     response::{
         AnthropicAccumulator, BlockKind, SseEvent, buffered_response, chat_finish_reason,
-        normalized_arguments, responses_response,
+        hosted_search_action, normalized_arguments, responses_response,
     },
 };
 
@@ -66,6 +67,7 @@ pub async fn openai_response(
     stream: bool,
     include_usage: bool,
     model: String,
+    traffic: Option<Arc<TrafficCapture>>,
 ) -> Result<Response, OpenAiError> {
     let response_id = match surface {
         OpenAiSurface::ChatCompletions => format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
@@ -80,11 +82,15 @@ pub async fn openai_response(
             response_id,
             model,
             created,
+            traffic,
         ));
     }
     let bytes = collect_generation(generation.body).await?;
     let events = decode_all(&bytes)?;
     let value = buffered_response(surface, &events, &response_id, &model, created)?;
+    if let Some(capture) = traffic.as_ref() {
+        capture.write_json("071-openai-downstream-response", &value);
+    }
     Ok((StatusCode::OK, Json(value)).into_response())
 }
 
@@ -140,6 +146,7 @@ fn streaming_response(
     response_id: String,
     model: String,
     created: u64,
+    traffic: Option<Arc<TrafficCapture>>,
 ) -> Response {
     let outcome = NativeResponseOutcome::default();
     let state = StreamState {
@@ -153,6 +160,10 @@ fn streaming_response(
         finished: false,
         bytes: 0,
         outcome: outcome.clone(),
+        traffic,
+        downstream: Vec::new(),
+        downstream_truncated: false,
+        capture_finished: false,
     };
     let stream = futures_util::stream::unfold(state, |mut state| async move {
         state
@@ -181,15 +192,26 @@ struct StreamState {
     finished: bool,
     bytes: usize,
     outcome: NativeResponseOutcome,
+    traffic: Option<Arc<TrafficCapture>>,
+    downstream: Vec<u8>,
+    downstream_truncated: bool,
+    capture_finished: bool,
 }
 
 impl StreamState {
     async fn next(&mut self) -> Option<Bytes> {
         loop {
             if let Some(bytes) = self.pending.pop_front() {
+                self.capture_bytes(&bytes);
                 return Some(bytes);
             }
             if self.finished {
+                let outcome = if self.outcome.failure().is_some() {
+                    "failed"
+                } else {
+                    "completed"
+                };
+                self.finish_capture(outcome);
                 return None;
             }
             match self.body.frame().await {
@@ -244,10 +266,44 @@ impl StreamState {
         }
     }
 
+    fn capture_bytes(&mut self, bytes: &[u8]) {
+        if self.downstream.len().saturating_add(bytes.len()) <= MAX_SSE_CAPTURE_BYTES {
+            self.downstream.extend_from_slice(bytes);
+        } else {
+            self.downstream_truncated = true;
+        }
+    }
+
+    fn finish_capture(&mut self, outcome: &str) {
+        if self.capture_finished {
+            return;
+        }
+        self.capture_finished = true;
+        if let Some(traffic) = self.traffic.as_ref() {
+            traffic.write_bytes("071-openai-downstream.sse", &self.downstream);
+            traffic.write_json(
+                "072-openai-stream-summary",
+                &json!({
+                    "outcome":outcome,
+                    "capturedBytes":self.downstream.len(),
+                    "truncated":self.downstream_truncated,
+                }),
+            );
+        }
+    }
+
     fn fail(&mut self, error: OpenAiError) {
         self.outcome.fail(error.message.to_string());
         self.pending.extend(self.renderer.failure(&error));
         self.finished = true;
+    }
+}
+
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        if !self.capture_finished {
+            self.finish_capture("abandoned");
+        }
     }
 }
 
@@ -325,7 +381,17 @@ impl Renderer {
                 let payload = match delta.get("type").and_then(Value::as_str) {
                     Some("text_delta") => json!({"content":delta.get("text").and_then(Value::as_str).unwrap_or_default()}),
                     Some("thinking_delta") => json!({"reasoning_content":delta.get("thinking").and_then(Value::as_str).unwrap_or_default()}),
-                    Some("input_json_delta") => json!({"tool_calls":[{"index":index,"function":{"arguments":delta.get("partial_json").and_then(Value::as_str).unwrap_or_default()}}]}),
+                    Some("input_json_delta") => {
+                        if self.state.blocks.iter().any(|block| {
+                            block.index == index as usize
+                                && matches!(block.kind, BlockKind::Tool { .. })
+                        }) {
+                            json!({"tool_calls":[{"index":index,"function":{"arguments":delta.get("partial_json").and_then(Value::as_str).unwrap_or_default()}}]})
+                        } else {
+                            return Ok(out);
+                        }
+                    }
+                    Some("citations_delta") => json!({"annotations":self.state.citations.last().cloned().into_iter().collect::<Vec<_>>()}),
                     Some("signature_delta") => return Ok(out),
                     _ => return Err(OpenAiError::invalid("Unsupported provider content delta", None::<String>)),
                 };
@@ -384,6 +450,7 @@ impl Renderer {
                     .iter()
                     .rev()
                     .find(|block| block.index == index)
+                    .cloned()
                     .ok_or_else(|| {
                         OpenAiError::invalid("Provider content block is missing", None::<String>)
                     })?;
@@ -410,6 +477,11 @@ impl Renderer {
                         "output_index":index,
                         "item":{"id":self.block_item_id("fc", index),"type":"function_call","call_id":id,"name":name,"arguments":"","status":"in_progress"},
                     }))),
+                    BlockKind::HostedSearch { id, .. } => out.push(self.responses_event("response.output_item.added", json!({
+                        "output_index":index,
+                        "item":{"id":id,"type":"web_search_call","status":"in_progress"},
+                    }))),
+                    BlockKind::HostedResult => {}
                 }
             }
             "content_block_delta" => {
@@ -428,9 +500,20 @@ impl Renderer {
                         "item_id":self.block_item_id("rs", index),"output_index":index,"summary_index":0,
                         "delta":delta.get("thinking").and_then(Value::as_str).unwrap_or_default(),
                     }))),
-                    Some("input_json_delta") => out.push(self.responses_event("response.function_call_arguments.delta", json!({
-                        "item_id":self.block_item_id("fc", index),"output_index":index,
-                        "delta":delta.get("partial_json").and_then(Value::as_str).unwrap_or_default(),
+                    Some("input_json_delta") => {
+                        if self.state.blocks.iter().any(|block| {
+                            block.index == index && matches!(block.kind, BlockKind::Tool { .. })
+                        }) {
+                            out.push(self.responses_event("response.function_call_arguments.delta", json!({
+                                "item_id":self.block_item_id("fc", index),"output_index":index,
+                                "delta":delta.get("partial_json").and_then(Value::as_str).unwrap_or_default(),
+                            })));
+                        }
+                    }
+                    Some("citations_delta") => out.push(self.responses_event("response.output_text.annotation.added", json!({
+                        "item_id":self.message_item_id(),"output_index":index,"content_index":0,
+                        "annotation_index":self.state.citations.len().saturating_sub(1),
+                        "annotation":self.state.citations.last().cloned().unwrap_or(Value::Null),
                     }))),
                     Some("signature_delta") => {}
                     _ => return Err(OpenAiError::invalid("Unsupported provider content delta", None::<String>)),
@@ -459,11 +542,11 @@ impl Renderer {
                         })));
                         out.push(self.responses_event("response.content_part.done", json!({
                             "item_id":self.message_item_id(),"output_index":index,"content_index":0,
-                            "part":{"type":"output_text","text":text,"annotations":[]},
+                            "part":{"type":"output_text","text":text,"annotations":self.state.citations},
                         })));
                         out.push(self.responses_event("response.output_item.done", json!({
                             "output_index":index,
-                            "item":{"id":self.message_item_id(),"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":[]}]},
+                            "item":{"id":self.message_item_id(),"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":self.state.citations}]},
                         })));
                     }
                     BlockKind::Thinking { text } => {
@@ -489,6 +572,15 @@ impl Renderer {
                             "item":{"id":self.block_item_id("fc", index),"type":"function_call","call_id":id,"name":name,"arguments":arguments,"status":"completed"},
                         })));
                     }
+                    BlockKind::HostedSearch {
+                        id,
+                        name,
+                        arguments,
+                    } => out.push(self.responses_event("response.output_item.done", json!({
+                        "output_index":index,
+                        "item":{"id":id,"type":"web_search_call","status":"completed","action":hosted_search_action(&name, &arguments)},
+                    }))),
+                    BlockKind::HostedResult => {}
                 }
             }
             "message_stop" => {
@@ -651,6 +743,7 @@ mod tests {
             "chatcmpl_test".into(),
             "kimi-k2.6".into(),
             1,
+            None,
         );
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
@@ -677,6 +770,7 @@ mod tests {
             "resp_test".into(),
             "grok-4.5".into(),
             1,
+            None,
         );
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(bytes.to_vec()).unwrap();

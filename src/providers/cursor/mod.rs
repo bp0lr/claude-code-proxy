@@ -291,6 +291,16 @@ impl Provider for CursorProvider {
         }
         let prompt = render_cursor_prompt(&body);
         let images = request::cursor_selected_images(&body);
+        if let Some(traffic) = ctx.traffic.as_ref() {
+            traffic.write_json(
+                "020-upstream-request",
+                &serde_json::json!({
+                    "model": requested,
+                    "prompt": prompt,
+                    "image_count": images.len(),
+                }),
+            );
+        }
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
@@ -298,6 +308,9 @@ impl Provider for CursorProvider {
             .run_agent(&auth.access_token, &prompt, &requested, &images)
             .await
             .map_err(cursor_provider_error)?;
+        if let Some(traffic) = ctx.traffic.as_ref() {
+            traffic.write_bytes("032-upstream-response-body.bin", &upstream.body);
+        }
         let bytes = if can_bridge_cursor_native_tools(&body, ctx.session_id.as_deref()) {
             let events =
                 decode_upstream_response(&upstream.body).map_err(cursor_decode_provider_error)?;
@@ -314,6 +327,9 @@ impl Provider for CursorProvider {
         } else {
             sse::frame_cursor_stream(&upstream, &message_id, &requested)
         };
+        if let Some(traffic) = ctx.traffic.as_ref() {
+            traffic.write_bytes("050-anthropic-intermediate.sse", &bytes);
+        }
         if let Some(monitor) = ctx.monitor.as_ref() {
             let (input_tokens, output_tokens) = usage_from_anthropic_sse(&bytes);
             monitor.stream_progress(

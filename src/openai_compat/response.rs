@@ -21,6 +21,12 @@ pub enum BlockKind {
         name: String,
         arguments: String,
     },
+    HostedSearch {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    HostedResult,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +71,7 @@ pub struct AnthropicAccumulator {
     pub blocks: Vec<Block>,
     pub stop_reason: Option<String>,
     pub usage: Usage,
+    pub citations: Vec<Value>,
     pub stopped: bool,
 }
 
@@ -124,6 +131,12 @@ impl AnthropicAccumulator {
                             .filter(|value| value != "{}")
                             .unwrap_or_default(),
                     },
+                    Some("server_tool_use") => BlockKind::HostedSearch {
+                        id: required_block_string(block, "id")?,
+                        name: required_block_string(block, "name")?,
+                        arguments: String::new(),
+                    },
+                    Some(kind) if kind.ends_with("_tool_result") => BlockKind::HostedResult,
                     Some(other) => {
                         return Err(OpenAiError::invalid(
                             format!("Unsupported provider output block '{other}'"),
@@ -173,13 +186,22 @@ impl AnthropicAccumulator {
                         );
                     }
                     (Some("signature_delta"), BlockKind::Thinking { .. }) => {}
-                    (Some("input_json_delta"), BlockKind::Tool { arguments, .. }) => {
+                    (
+                        Some("input_json_delta"),
+                        BlockKind::Tool { arguments, .. }
+                        | BlockKind::HostedSearch { arguments, .. },
+                    ) => {
                         arguments.push_str(
                             delta
                                 .get("partial_json")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default(),
                         );
+                    }
+                    (Some("citations_delta"), BlockKind::Text { .. }) => {
+                        if let Some(citation) = delta.get("citation") {
+                            self.citations.push(openai_citation(citation));
+                        }
                     }
                     _ => {
                         return Err(OpenAiError::invalid(
@@ -330,6 +352,12 @@ pub fn chat_response(
     if !tools.is_empty() {
         message.insert("tool_calls".to_string(), Value::Array(tools));
     }
+    if !state.citations.is_empty() {
+        message.insert(
+            "annotations".to_string(),
+            Value::Array(state.citations.clone()),
+        );
+    }
     json!({
         "id":response_id,
         "object":"chat.completion",
@@ -382,24 +410,34 @@ pub fn responses_response(
             "type":"message",
             "role":"assistant",
             "status":"completed",
-            "content":[{"type":"output_text", "text":text, "annotations":[]}],
+            "content":[{"type":"output_text", "text":text, "annotations":state.citations}],
         }));
     }
     for (index, block) in state.blocks.iter().enumerate() {
-        if let BlockKind::Tool {
-            id,
-            name,
-            arguments,
-        } = &block.kind
-        {
-            output.push(json!({
+        match &block.kind {
+            BlockKind::Tool {
+                id,
+                name,
+                arguments,
+            } => output.push(json!({
                 "id":format!("fc_{}", stable_suffix(response_id, index + 2)),
                 "type":"function_call",
                 "call_id":id,
                 "name":name,
                 "arguments":normalized_arguments(arguments),
                 "status":"completed",
-            }));
+            })),
+            BlockKind::HostedSearch {
+                id,
+                name,
+                arguments,
+            } => output.push(json!({
+                "id":id,
+                "type":"web_search_call",
+                "status":"completed",
+                "action":hosted_search_action(name, arguments),
+            })),
+            _ => {}
         }
     }
     json!({
@@ -422,6 +460,31 @@ pub fn chat_finish_reason(reason: Option<&str>) -> &'static str {
         Some("max_tokens") => "length",
         _ => "stop",
     }
+}
+
+pub fn hosted_search_action(_name: &str, arguments: &str) -> Value {
+    let query = serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("query")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    json!({"type":"search", "query":query})
+}
+
+fn openai_citation(citation: &Value) -> Value {
+    json!({
+        "type":"url_citation",
+        "url_citation":{
+            "url":citation.get("url").and_then(Value::as_str).unwrap_or_default(),
+            "title":citation.get("title").and_then(Value::as_str).unwrap_or_default(),
+            "start_index":0,
+            "end_index":0,
+        }
+    })
 }
 
 pub fn normalized_arguments(arguments: &str) -> String {
@@ -503,6 +566,85 @@ mod tests {
                 data: json!({"type":"message_stop"}),
             },
         ]
+    }
+
+    #[test]
+    fn maps_hosted_search_and_citations_to_responses() {
+        let events = vec![
+            SseEvent {
+                event: Some("message_start".into()),
+                data: json!({"type":"message_start","message":{"id":"msg_1","usage":{}}}),
+            },
+            SseEvent {
+                event: Some("content_block_start".into()),
+                data: json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"search_1","name":"x_search","input":{}}}),
+            },
+            SseEvent {
+                event: Some("content_block_delta".into()),
+                data: json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"rust\"}"}}),
+            },
+            SseEvent {
+                event: Some("content_block_stop".into()),
+                data: json!({"type":"content_block_stop","index":0}),
+            },
+            SseEvent {
+                event: Some("content_block_start".into()),
+                data: json!({"type":"content_block_start","index":1,"content_block":{"type":"x_search_tool_result","tool_use_id":"search_1","content":[]}}),
+            },
+            SseEvent {
+                event: Some("content_block_stop".into()),
+                data: json!({"type":"content_block_stop","index":1}),
+            },
+            SseEvent {
+                event: Some("content_block_start".into()),
+                data: json!({"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}),
+            },
+            SseEvent {
+                event: Some("content_block_delta".into()),
+                data: json!({"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"result"}}),
+            },
+            SseEvent {
+                event: Some("content_block_delta".into()),
+                data: json!({"type":"content_block_delta","index":2,"delta":{"type":"citations_delta","citation":{"url":"https://example.com","title":"Example"}}}),
+            },
+            SseEvent {
+                event: Some("content_block_stop".into()),
+                data: json!({"type":"content_block_stop","index":2}),
+            },
+            SseEvent {
+                event: Some("message_delta".into()),
+                data: json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+            },
+            SseEvent {
+                event: Some("message_stop".into()),
+                data: json!({"type":"message_stop"}),
+            },
+        ];
+        let response = buffered_response(
+            OpenAiSurface::Responses,
+            &events,
+            "resp_test",
+            "grok-4.5",
+            1,
+        )
+        .unwrap();
+        assert!(
+            response["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "web_search_call")
+        );
+        let message = response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "message")
+            .unwrap();
+        assert_eq!(
+            message["content"][0]["annotations"][0]["type"],
+            "url_citation"
+        );
     }
 
     #[test]

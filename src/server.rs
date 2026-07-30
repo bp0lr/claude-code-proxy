@@ -485,6 +485,7 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
                     parsed.stream,
                     parsed.include_usage,
                     normalized_model.clone(),
+                    traffic.clone(),
                 )
                 .await
                 {
@@ -736,6 +737,7 @@ async fn handler_chat_completions(
                     parsed.stream,
                     parsed.include_usage,
                     normalized_model.clone(),
+                    traffic.clone(),
                 )
                 .await
                 {
