@@ -1,7 +1,12 @@
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use axum::response::IntoResponse;
 use claude_code_proxy::{
+    MessagesRequest,
+    config::AliasProvider,
     monitor::{MonitorHandle, RequestStatus},
+    provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
     registry::Registry,
     server::{app, app_with_monitor, app_with_options, bind_proxy_listener},
 };
@@ -11,6 +16,100 @@ use tower::util::ServiceExt;
 
 fn body_string(json: &str) -> Body {
     Body::from(json.to_string())
+}
+
+struct FakeCli;
+
+impl CliHandlers for FakeCli {
+    fn login(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn device(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn status(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn logout(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+static FAKE_CLI: FakeCli = FakeCli;
+
+struct FakeProvider {
+    name: &'static str,
+    models: Vec<String>,
+}
+
+#[async_trait]
+impl Provider for FakeProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        self.models.clone()
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+
+    async fn generate_anthropic_stream(
+        &self,
+        body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> Result<Generation, ProviderError> {
+        let model = body.model.unwrap_or_default();
+        let sse = format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_fake\",\"model\":{model:?},\"usage\":{{\"input_tokens\":2}}}}}}\n\nevent: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{name}\"}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+            name = self.name,
+        );
+        Ok(Generation {
+            body: GenerationBody::BufferedSse(sse.into()),
+            resolved_model: model,
+        })
+    }
+}
+
+fn routed_registry() -> Arc<Registry> {
+    Arc::new(Registry::from_providers(
+        AliasProvider::Kimi,
+        vec![
+            Arc::new(FakeProvider {
+                name: "kimi",
+                models: vec!["kimi-k2.6".to_string()],
+            }) as Arc<dyn Provider>,
+            Arc::new(FakeProvider {
+                name: "grok",
+                models: vec!["grok-4.5".to_string()],
+            }),
+            Arc::new(FakeProvider {
+                name: "cursor",
+                models: vec!["cursor".to_string()],
+            }),
+        ],
+    ))
 }
 
 #[tokio::test]
@@ -334,6 +433,142 @@ async fn chat_completions_route_uses_responses_api_gate() {
     .unwrap();
     assert_eq!(body["error"]["type"], "invalid_request_error");
     assert_eq!(body["error"]["code"], "invalid_json");
+}
+
+#[tokio::test]
+async fn openai_routes_select_non_codex_providers_and_aliases() {
+    for (uri, request, expected) in [
+        (
+            "/v1/chat/completions",
+            json!({"model":"kimi-k2.6","messages":[{"role":"user","content":"hello"}]}),
+            "kimi",
+        ),
+        (
+            "/v1/responses",
+            json!({"model":"grok-4.5","input":"hello"}),
+            "grok",
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model":"cursor:gpt-5.5","messages":[{"role":"user","content":"hello"}]}),
+            "cursor",
+        ),
+        (
+            "/v1/responses",
+            json!({"model":"sonnet","input":"hello"}),
+            "kimi",
+        ),
+    ] {
+        let response = app_with_options(routed_registry(), None, true)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(body_string(&request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri} {request}");
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let text = if uri.ends_with("responses") {
+            value["output"][0]["content"][0]["text"].as_str()
+        } else {
+            value["choices"][0]["message"]["content"].as_str()
+        };
+        assert_eq!(text, Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn routed_openai_streams_use_surface_specific_events() {
+    let chat = app_with_options(routed_registry(), None, true)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(body_string(
+                    r#"{"model":"kimi-k2.6","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let chat = String::from_utf8(
+        axum::body::to_bytes(chat.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(chat.contains("chat.completion.chunk"));
+    assert!(chat.contains("\"total_tokens\":3"));
+    assert!(chat.ends_with("data: [DONE]\n\n"));
+
+    let responses = app_with_options(routed_registry(), None, true)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(body_string(
+                    r#"{"model":"grok-4.5","stream":true,"input":"hello"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let responses = String::from_utf8(
+        axum::body::to_bytes(responses.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(responses.contains("event: response.created"));
+    assert!(responses.contains("event: response.completed"));
+    assert!(responses.contains("\"sequence_number\":0"));
+}
+
+#[tokio::test]
+async fn non_codex_validation_uses_openai_errors_before_generation() {
+    let monitor = MonitorHandle::new(10);
+    let response = app_with_options(routed_registry(), Some(monitor.clone()), true)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("x-client-request-id", "invalid-routed-request")
+                .body(body_string(
+                    r#"{"model":"kimi-k2.6","messages":[{"role":"user","content":"hello"}],"temperature":0.5}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["error"]["param"], "temperature");
+    assert_eq!(value["error"]["code"], "unsupported_parameter");
+    assert!(
+        claude_code_proxy::session::existing_session_now(Some("invalid-routed-request")).is_none()
+    );
+    let snapshot = monitor.snapshot();
+    assert_eq!(snapshot.recent[0].session_seq, None);
+    assert_eq!(snapshot.recent[0].provider, None);
 }
 
 #[tokio::test]

@@ -98,6 +98,24 @@ impl Registry {
         Self::new(crate::config::alias_provider())
     }
 
+    pub fn from_providers(
+        alias_provider: AliasProvider,
+        providers: impl IntoIterator<Item = Arc<dyn Provider>>,
+    ) -> Self {
+        let mut models = BTreeMap::new();
+        let mut handlers = BTreeMap::new();
+        for provider in providers {
+            let name = provider.name().to_string();
+            models.insert(name.clone(), provider.supported_models());
+            handlers.insert(name, provider);
+        }
+        Self {
+            alias_provider,
+            models,
+            handlers,
+        }
+    }
+
     pub fn list_provider_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.handlers.keys().cloned().collect();
         names.sort_unstable();
