@@ -54,6 +54,7 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tz-syste
 winresource = "0.1"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3.14"
 assert_cmd = "2"
 predicates = "3"
