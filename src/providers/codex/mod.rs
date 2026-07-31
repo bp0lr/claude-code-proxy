@@ -8,6 +8,7 @@ pub(crate) mod events;
 pub mod images;
 pub mod native;
 pub mod request_summary;
+pub mod transcription;
 pub mod translate;
 pub mod websocket;
 
