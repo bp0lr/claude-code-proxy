@@ -48,6 +48,7 @@ crossterm = "0.28"
 # Without it Windows detects the zone name but has nothing to resolve it
 # against, so every local timestamp silently renders as UTC.
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
+tiktoken-rs = { version = "0.12", default-features = false }
 
 # Host-gated: on any other platform this is never fetched or built.
 [target.'cfg(windows)'.build-dependencies]
