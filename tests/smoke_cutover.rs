@@ -7,7 +7,10 @@ use axum::response::Response;
 use claude_code_proxy::providers::codex::compaction::clear_all_compactions_for_tests;
 use claude_code_proxy::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_proxy::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
-use claude_code_proxy::{registry::Registry, server::app};
+use claude_code_proxy::{
+    registry::Registry,
+    server::{app, app_with_options},
+};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -91,6 +94,22 @@ async fn call_messages_body(body: Value) -> Response {
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "smoke-session")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn call_responses_body(body: Value) -> Response {
+    let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    app_with_options(Arc::new(Registry::with_default_alias()), None, true)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
                 .header("content-type", "application/json")
                 .header("x-claude-code-session-id", "smoke-session")
                 .body(Body::from(body.to_string()))
@@ -830,6 +849,37 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
     let sent = captured.lock().unwrap().clone().unwrap();
     assert_eq!(sent["model"], "gpt-5.5");
     assert_eq!(sent["stream"], true);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_native_responses_preserves_parallel_tool_calls() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let _ = captured.lock().map(|mut guard| *guard = Some(body));
+            br#"{"id":"resp_1","object":"response","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}"#.to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let response = call_responses_body(json!({
+        "model":"gpt-5.4",
+        "input":"hello",
+        "parallel_tool_calls":false
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let sent = captured.lock().unwrap().clone().unwrap();
+    assert_eq!(sent["parallel_tool_calls"], false);
 }
 
 /// Resets the retry-delay override even when the test panics, so later tests

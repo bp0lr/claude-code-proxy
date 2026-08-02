@@ -7,7 +7,8 @@ use serde_json::Value;
 use crate::anthropic::schema::MessagesRequest;
 use crate::config;
 use crate::providers::translate_shared::{
-    ContentBlock, flatten_system_text, image_source_to_url, normalize_content, read_effort,
+    ContentBlock, flatten_system_text, image_source_to_url, normalize_content, parallel_tool_calls,
+    read_effort,
 };
 
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
@@ -458,7 +459,7 @@ fn translate_request_inner(
     let input = build_input(req);
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
-    let parallel_tool_calls = !disable_parallel_tool_use(req);
+    let parallel_tool_calls = parallel_tool_calls(req).unwrap_or(true);
 
     let mut text = ResponsesText {
         verbosity: Some("low".to_string()),
@@ -785,15 +786,6 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
         }
         _ => Ok(None),
     }
-}
-
-fn disable_parallel_tool_use(req: &MessagesRequest) -> bool {
-    req.extra
-        .get("tool_choice")
-        .and_then(Value::as_object)
-        .and_then(|choice| choice.get("disable_parallel_tool_use"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
 }
 
 fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
