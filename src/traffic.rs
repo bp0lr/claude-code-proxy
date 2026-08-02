@@ -320,6 +320,10 @@ impl StreamTrafficCapture {
     }
 
     pub fn finish(self, traffic: &TrafficCapture, completion: Value) {
+        self.finish_named(traffic, completion, "061-grok-stream-summary");
+    }
+
+    pub fn finish_named(self, traffic: &TrafficCapture, completion: Value, summary_name: &str) {
         let upstream_event_count = self.upstream_events.len();
         let downstream_event_count = self.downstream_events.len();
         if !self.upstream_sse.is_empty() {
@@ -346,7 +350,7 @@ impl StreamTrafficCapture {
             traffic.write_json_event("050-downstream-event", &value);
         }
         traffic.write_json(
-            "061-grok-stream-summary",
+            summary_name,
             &serde_json::json!({
                 "completion": completion,
                 "upstream_sse": {

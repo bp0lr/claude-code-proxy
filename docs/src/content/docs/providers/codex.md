@@ -35,7 +35,14 @@ Claude Code summary compaction requests are capped at low effort by default beca
 ## Tools and multimodal input
 
 - Claude function tools and tool results map to Responses API function calls and outputs.
-- Claude Code hosted web search maps to Codex `web_search`, including supported domain filters and forced tool choice.
+- Claude Code's forced `web_search_20250305` subrequest uses Codex's standalone
+  `/alpha/search` endpoint. It keeps the resolved model, omits search reasoning,
+  and preserves non-empty domain filters, so Luna searches do not require a Sol
+  Responses turn. Automatic hosted-search requests remain on the full Responses
+  API because the standalone endpoint cannot decide whether to invoke a tool.
+  Structured result DTOs map back to Anthropic `server_tool_use` and
+  `web_search_tool_result` blocks, while standalone text output remains text.
+  The proxy locally estimates input and output tokens and reports search usage.
 - Top-level base64 user images map to `input_image`.
 - Supported base64 images nested in tool results also map to `input_image`.
 - Remote image URLs, malformed images, and unsupported tool-result image forms remain textual placeholders.
@@ -44,6 +51,8 @@ Claude Code summary compaction requests are capped at low effort by default beca
 ## Transport and continuation
 
 WebSocket is the default transport. Set `CCP_CODEX_TRANSPORT=http` for HTTP SSE, or `auto` to use WebSocket with HTTP fallback only when setup fails before a request is sent.
+
+WebSocket setup honors `HTTP_PROXY` for `ws://`, `HTTPS_PROXY` for the default `wss://` endpoint, `ALL_PROXY` as a fallback, and `NO_PROXY` exclusions. A normal HTTP proxy can therefore carry the default WebSocket connection with CONNECT; TUN mode is not required. Set proxy variables before starting the process and restart after changing them. For example, setting `HTTPS_PROXY` to `http://127.0.0.1:7890` sends HTTPS/WSS destinations through the HTTP proxy at port 7890; it does not require an `https://` proxy URL.
 
 `CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables append-only WebSocket continuation. It reuses a session connection and sends `previous_response_id` only when the translated request shape and transcript extension are safe. State is in memory, keyed by Claude Code session ID.
 
@@ -91,7 +100,7 @@ While the native request is active, the monitor shows `compacting`. Structured l
 
 ## OpenAI-compatible APIs
 
-`CCP_CODEX_RESPONSES_API=1` enables both `POST /v1/responses` and `POST /v1/chat/completions`.
+`CCP_CODEX_RESPONSES_API=1` enables both `POST /v1/responses` and `POST /v1/chat/completions`. The setting is under Codex configuration, but the routes also accept Kimi, Grok, OpenCode Go, and Cursor models.
 
 The Responses route preserves native JSON or SSE response bodies for registered Codex models. The Chat Completions route translates standard text messages, reasoning effort, JSON object or JSON Schema output, and buffered or streaming responses. Its omitted reasoning effort defaults to `medium`; the proxy-wide Codex effort override still takes precedence.
 

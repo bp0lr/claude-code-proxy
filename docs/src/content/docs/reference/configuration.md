@@ -39,6 +39,10 @@ These settings configure the proxy process. Claude Code client settings such as 
     "baseUrl": "https://cli-chat-proxy.grok.com/v1",
     "clientVersion": "0.2.93"
   },
+  "opencode": {
+    "apiKey": "YOUR_OPENCODE_GO_API_KEY",
+    "baseUrl": "https://opencode.ai/zen/go/v1"
+  },
   "cursor": {
     "baseUrl": "https://api2.cursor.sh",
     "clientVersion": "0.48.5",
@@ -109,6 +113,14 @@ Codex auto-review classifier requests use `gpt-5.6-luna` by default. Requests ro
 | `CCP_GROK_TOOL_IMAGE` | none | `omit` | Selects `omit`, `reattach`, `inline`, or `reject` image handling. |
 | `CCP_GROK_HOSTED_SEARCH` | none | off | Set to `1`, `on`, or `true` to let hosted search tools replace the caller's own search tools and force them on an explicit search turn. |
 | `CCP_GROK_SEARCH_BLOCKS` | none | `text` | Selects how a hosted search is reported: `text` for a text block, `native` for `server_tool_use` plus a `*_tool_result` block. |
+
+## OpenCode Go
+
+| Environment | Config key | Default | Purpose |
+| --- | --- | --- | --- |
+| `CCP_OPENCODE_API_KEY` | `opencode.apiKey` | unset | OpenCode Go API key; takes precedence over `OPENCODE_API_KEY` and config. |
+| `OPENCODE_API_KEY` | `opencode.apiKey` | unset | Fallback API-key variable accepted by the proxy when the CCP-specific variable is unset. |
+| `CCP_OPENCODE_BASE_URL` | `opencode.baseUrl` | `https://opencode.ai/zen/go/v1` | Changes the OpenCode Go API base URL. |
 
 ## Cursor Agent
 
