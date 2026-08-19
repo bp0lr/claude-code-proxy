@@ -24,17 +24,17 @@ The proxy owns and refreshes its Grok tokens. It does not read `~/.grok/auth.jso
 
 ## Models
 
-The registered IDs are `grok-composer-2.5-fast` and `grok-4.5`. Account and regional access can vary. Use the same concrete Grok ID for `ANTHROPIC_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL`.
+The registered IDs are `grok-composer-2.5-fast`, `grok-4.5`, and `grok-4.6`. Account and regional access can vary. Use the same concrete Grok ID for `ANTHROPIC_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL`.
 
 ```sh
-ANTHROPIC_MODEL=grok-4.5 \
-ANTHROPIC_SMALL_FAST_MODEL=grok-4.5 \
-  claude --model grok-4.5
+ANTHROPIC_MODEL=grok-4.6 \
+ANTHROPIC_SMALL_FAST_MODEL=grok-4.6 \
+  claude --model grok-4.6
 ```
 
 ## Reasoning and tools
 
-The proxy translates Claude messages, function tools, tool results, thinking controls, token usage, and streaming events. Grok reasoning text appears as Claude Code thinking blocks.
+The proxy translates Claude messages, function tools, tool results, thinking controls, token usage, and streaming events. Grok reasoning text appears as Claude Code thinking blocks. Grok supports `none`, `low`, `medium`, and `high` effort levels. `xhigh` is forwarded for `grok-4.6`; higher compatibility levels are mapped to the highest supported Grok level for other registered models.
 
 Search reaches Grok-native tools when the caller asks for it:
 
@@ -52,6 +52,10 @@ A hosted search is reported as a text block naming the query.
 `CCP_GROK_SEARCH_BLOCKS=native` preserves `server_tool_use` plus
 `web_search_tool_result` or `x_search_tool_result` for clients that consume
 hosted-tool blocks.
+
+## OpenAI-compatible APIs
+
+When the OpenAI routes are enabled, Grok models work with both `POST /v1/chat/completions` and `POST /v1/responses`. Text, reasoning, function tools, tool results, token limits, streaming, usage, and errors use the standard shape for the chosen route. Set `reasoning_effort` on Chat Completions or `reasoning.effort` on Responses. Responses requests also return Grok searches as `web_search_call` items. Citations are available on both routes.
 
 ## Multimodal support
 
