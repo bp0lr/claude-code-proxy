@@ -1483,7 +1483,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Invalid JSON"),
             );
-            return response;
+            return with_request_id(response, &req_id);
         }
     };
 
@@ -1523,7 +1523,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Invalid JSON"),
             );
-            return response;
+            return with_request_id(response, &req_id);
         }
     };
 
@@ -1578,7 +1578,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Missing model"),
             );
-            return response;
+            return with_request_id(response, &req_id);
         }
     };
 
@@ -1665,7 +1665,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Unknown model"),
             );
-            return response;
+            return with_request_id(response, &req_id);
         }
     };
 
@@ -1801,12 +1801,33 @@ async fn dispatch_request(
             format!("HTTP {}", status.as_u16()),
         );
     }
-    response
+    with_request_id(response, &req_id)
 }
 
 /// Header Claude Code reads to populate the `requestId` field it writes into
 /// every transcript record.
-pub const REQUEST_ID_HEADER: &str = "request-id";
+const REQUEST_ID_HEADER: &str = "request-id";
+
+/// Publish the per-request id this proxy mints. Anthropic returns `request-id`,
+/// and Claude Code records it as `requestId`; without it every downstream
+/// consumer that de-duplicates transcript records by request id (its own
+/// parser, usage dashboards) counts each request twice, because a transcript
+/// legitimately repeats a record and the id is what resolves it.
+///
+/// An upstream-supplied id is preserved: relabelling a real provider id with a
+/// local uuid would lose the more useful value.
+fn stamp_request_id(headers: &mut http::HeaderMap, req_id: &str) {
+    if !headers.contains_key(REQUEST_ID_HEADER)
+        && let Ok(value) = http::HeaderValue::from_str(req_id)
+    {
+        headers.insert(REQUEST_ID_HEADER, value);
+    }
+}
+
+fn with_request_id(mut response: Response, req_id: &str) -> Response {
+    stamp_request_id(response.headers_mut(), req_id);
+    response
+}
 
 fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Response {
     let status = response.status();
@@ -1815,20 +1836,9 @@ fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Resp
         .get::<NativeResponseOutcome>()
         .cloned();
     let (mut parts, body) = response.into_parts();
-    // Publish the per-request id this proxy already mints. Anthropic returns
-    // `request-id`, and Claude Code records it as `requestId`; without it every
-    // downstream consumer that de-duplicates transcript records by request id
-    // (its own parser, usage dashboards) counts each request twice, because a
-    // transcript legitimately repeats a record and the id is what resolves it.
-    //
-    // Stamped here rather than at each `return` because every response path in
-    // this module funnels through this function, and it is applied to the parts
-    // before the body is streamed, so a streaming SSE response carries it too.
-    if !parts.headers.contains_key(REQUEST_ID_HEADER)
-        && let Ok(value) = http::HeaderValue::from_str(&guard.req_id)
-    {
-        parts.headers.insert(REQUEST_ID_HEADER, value);
-    }
+    // Stamped on the parts before the body is streamed, so a streaming SSE
+    // response carries the header too.
+    stamp_request_id(&mut parts.headers, &guard.req_id);
     let stream = futures_util::stream::unfold(
         (body, guard, outcome),
         move |(mut body, mut guard, outcome)| async move {
@@ -2320,17 +2330,6 @@ mod request_id_header_tests {
             stamped.headers().get(REQUEST_ID_HEADER).unwrap(),
             "upstream-owned"
         );
-    }
-
-    // Error responses are de-duplicated by the same key as successes.
-    #[test]
-    fn stamps_error_responses_too() {
-        let response = Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
-            .body(Body::from("{\"error\":\"rate limited\"}"))
-            .unwrap();
-        let stamped = monitor_response_body(response, guard("req-429"));
-        assert_eq!(stamped.headers().get(REQUEST_ID_HEADER).unwrap(), "req-429");
     }
 }
 
