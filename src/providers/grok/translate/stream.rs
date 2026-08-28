@@ -51,7 +51,11 @@ impl SseDecoder {
     fn end_line(&mut self, events: &mut Vec<SseEvent>) -> anyhow::Result<()> {
         if self.frame.len() == self.line_start {
             if !self.frame.is_empty() {
-                events.push(parse_frame(&self.frame)?);
+                // None is a keepalive: a frame that carries no data dispatches
+                // nothing, which is not the same as a broken stream.
+                if let Some(event) = parse_frame(&self.frame)? {
+                    events.push(event);
+                }
             }
             self.frame.clear();
             self.line_start = 0;
@@ -63,7 +67,18 @@ impl SseDecoder {
     }
 }
 
-fn parse_frame(frame: &[u8]) -> anyhow::Result<SseEvent> {
+/// Parse one SSE frame, or None when it carries nothing to dispatch.
+///
+/// A frame with no `data` field is a KEEPALIVE, not a fault. Grok sends them
+/// while a model is thinking, and this used to `bail!`, which aborted the whole
+/// stream: any request long enough to need a heartbeat died with "Grok SSE
+/// frame lacks data" after minutes of waiting, while short ones - where the
+/// first data frame arrives before any heartbeat - worked fine. That is the
+/// signature it was diagnosed by.
+///
+/// Per the SSE specification a frame whose data buffer is empty dispatches no
+/// event; comment-only frames (`: ping`) exist for exactly this purpose.
+fn parse_frame(frame: &[u8]) -> anyhow::Result<Option<SseEvent>> {
     let frame = std::str::from_utf8(frame)
         .map_err(|_| anyhow::anyhow!("Grok SSE frame contains invalid UTF-8"))?;
     let mut event = None;
@@ -81,12 +96,12 @@ fn parse_frame(frame: &[u8]) -> anyhow::Result<SseEvent> {
         }
     }
     if data.is_empty() {
-        anyhow::bail!("Grok SSE frame lacks data")
+        return Ok(None);
     }
-    Ok(SseEvent {
+    Ok(Some(SseEvent {
         event,
         data: data.join("\n"),
-    })
+    }))
 }
 
 pub struct StreamTranslator {
@@ -328,6 +343,28 @@ mod tests {
             decoder.finish().unwrap();
             assert_eq!(events, expected);
         }
+    }
+
+    #[test]
+    fn decoder_treats_a_frame_without_data_as_a_keepalive() {
+        // Grok sends these while a model is thinking. This used to abort the
+        // whole stream, so any request long enough to need a heartbeat died
+        // with "Grok SSE frame lacks data" after minutes of waiting, while a
+        // short one - whose first data frame arrives before any heartbeat -
+        // worked fine. Per the SSE spec a frame with an empty data buffer
+        // dispatches no event; it is not a broken stream.
+        let mut decoder = SseDecoder::default();
+        let events = decoder
+            .push(b": ping\n\nevent: heartbeat\n\ndata: real\n\n")
+            .unwrap();
+        decoder.finish().unwrap();
+        assert_eq!(
+            events,
+            vec![SseEvent {
+                event: None,
+                data: "real".into(),
+            }]
+        );
     }
 
     #[test]
