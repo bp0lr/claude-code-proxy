@@ -33,16 +33,16 @@ pub struct Generation {
 impl Generation {
     /// One-line accounting summary, or `None` when the proxy reported nothing.
     fn usage_line(&self) -> Option<String> {
-        let stop = self.stop_reason.as_deref().unwrap_or("desconocido");
+        let stop = self.stop_reason.as_deref().unwrap_or("unknown");
         match (self.input_tokens, self.output_tokens) {
             (None, None) => None,
             (input, output) => Some(format!(
-                "[uso] entrada={} salida={} stop={}{}",
+                "[usage] input={} output={} stop={}{}",
                 input.map_or_else(|| "?".into(), |value| value.to_string()),
                 output.map_or_else(|| "?".into(), |value| value.to_string()),
                 stop,
                 if stop == "max_tokens" {
-                    " — la salida quedo truncada por max_tokens"
+                    " — the output was truncated by max_tokens"
                 } else {
                     ""
                 }
@@ -85,8 +85,8 @@ impl HttpBackend {
 
     fn unreachable(&self, reason: &str) -> String {
         format!(
-            "No se pudo contactar al proxy en 127.0.0.1:{} ({reason}). \
-             Levantalo con: claude-code-proxy serve --no-monitor",
+            "Could not reach the proxy on 127.0.0.1:{} ({reason}). \
+             Start it with: claude-code-proxy serve --no-monitor",
             self.port
         )
     }
@@ -103,14 +103,17 @@ fn build_request_body(args: &Value, default_model: &str) -> Result<Value, String
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|prompt| !prompt.is_empty())
-        .ok_or("prompt es obligatorio y no puede estar vacio")?;
+        .ok_or("prompt is required and cannot be empty")?;
 
     let model = args
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or(default_model);
     assert_allowed_model(model).map_err(|_| {
-        format!("Modelo no soportado: {model}. Opciones: grok-4.6, grok-4.5, grok-composer-2.5-fast")
+        format!(
+            "Unsupported model: {model}. Options: {}",
+            crate::registry::GROK_MODELS.join(", ")
+        )
     })?;
 
     let max_tokens = match args.get("max_tokens") {
@@ -118,7 +121,7 @@ fn build_request_body(args: &Value, default_model: &str) -> Result<Value, String
         Some(value) => value
             .as_u64()
             .filter(|tokens| (1..=200_000).contains(tokens))
-            .ok_or("max_tokens debe ser un entero entre 1 y 200000")?,
+            .ok_or("max_tokens must be an integer between 1 and 200000")?,
     };
 
     let mut body = json!({
@@ -142,7 +145,7 @@ fn build_request_body(args: &Value, default_model: &str) -> Result<Value, String
         let value = temperature
             .as_f64()
             .filter(|value| (0.0..=2.0).contains(value))
-            .ok_or("temperature debe estar entre 0 y 2")?;
+            .ok_or("temperature must be between 0 and 2")?;
         body["temperature"] = json!(value);
     }
 
@@ -174,8 +177,8 @@ fn extract_generation(payload: &Value) -> Result<Generation, String> {
         .map(str::to_string);
 
     if text.is_empty() {
-        let stop = stop_reason.as_deref().unwrap_or("desconocido");
-        return Err(format!("Grok no devolvio texto (stop_reason: {stop})"));
+        let stop = stop_reason.as_deref().unwrap_or("unknown");
+        return Err(format!("Grok returned no text (stop_reason: {stop})"));
     }
 
     Ok(Generation {
@@ -195,7 +198,7 @@ fn error_message(payload: &Value, status: u16, raw: &str) -> String {
         .pointer("/error/message")
         .and_then(Value::as_str)
         .unwrap_or_else(|| raw.get(..raw.len().min(500)).unwrap_or(raw));
-    format!("El proxy devolvio HTTP {status}: {detail}")
+    format!("The proxy returned HTTP {status}: {detail}")
 }
 
 impl Backend for HttpBackend {
@@ -214,10 +217,10 @@ impl Backend for HttpBackend {
         let status = response.status();
         let raw = response
             .text()
-            .map_err(|error| format!("No se pudo leer la respuesta del proxy: {error}"))?;
+            .map_err(|error| format!("Could not read the proxy response: {error}"))?;
         let payload: Value = serde_json::from_str(&raw).map_err(|_| {
             let preview = raw.get(..raw.len().min(500)).unwrap_or(&raw);
-            format!("Respuesta no-JSON del proxy (HTTP {status}): {preview}")
+            format!("Non-JSON response from the proxy (HTTP {status}): {preview}")
         })?;
 
         if !status.is_success() {
@@ -230,10 +233,10 @@ impl Backend for HttpBackend {
         let url = format!("http://127.0.0.1:{}/healthz", self.port);
         match self.client.get(url).timeout(Duration::from_secs(5)).send() {
             Ok(response) if response.status().is_success() => {
-                format!("Proxy activo en 127.0.0.1:{}.", self.port)
+                format!("Proxy is up on 127.0.0.1:{}.", self.port)
             }
             Ok(response) => format!(
-                "El proxy respondio HTTP {} en /healthz.",
+                "The proxy answered HTTP {} on /healthz.",
                 response.status().as_u16()
             ),
             Err(error) => self.unreachable(&error.to_string()),
@@ -250,7 +253,7 @@ impl Backend for HttpBackend {
         let status = response.status();
         let body = response
             .text()
-            .map_err(|error| format!("No se pudo leer la respuesta del proxy: {error}"))?;
+            .map_err(|error| format!("Could not read the proxy response: {error}"))?;
         if !status.is_success() {
             let payload: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             return Err(error_message(&payload, status.as_u16(), &body));
@@ -263,37 +266,37 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "generate",
-            "description": "Genera texto con Grok a traves del proxy local. Pensado para \
-                redaccion de largo aliento (escenas, dialogos, escaletas) donde queres la \
-                voz de Grok en lugar de la propia. Devuelve el texto crudo.",
+            "description": "Generate text with Grok through the local proxy. Meant for \
+                long-form writing (scenes, dialogue, outlines) where you want Grok's voice \
+                instead of your own. Returns the raw text.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "La consigna. Se manda como mensaje de usuario."
+                        "description": "The prompt. Sent as a user message."
                     },
                     "system": {
                         "type": "string",
-                        "description": "System prompt: voz, formato, restricciones. Opcional \
-                            pero muy recomendado para mantener consistencia entre llamadas."
+                        "description": "System prompt: voice, format, constraints. Optional, \
+                            but strongly recommended to keep separate calls consistent."
                     },
                     "model": {
                         "type": "string",
-                        "enum": ["grok-4.6", "grok-4.5", "grok-composer-2.5-fast"],
-                        "description": "Modelo. Default: grok-4.5. grok-4.6 es el mas nuevo."
+                        "enum": crate::registry::GROK_MODELS,
+                        "description": "Model. Defaults to grok-4.5; grok-4.6 is the newest."
                     },
                     "max_tokens": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 200000,
-                        "description": "Tope de tokens de salida. Default: 16384."
+                        "description": "Output token ceiling. Defaults to 16384."
                     },
                     "temperature": {
                         "type": "number",
                         "minimum": 0,
                         "maximum": 2,
-                        "description": "0 deterministico, 1 variado. Omitir usa el default del modelo."
+                        "description": "0 is deterministic, 1 is varied. Omit to use the model default."
                     }
                 },
                 "required": ["prompt"],
@@ -302,16 +305,16 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "status",
-            "description": "Verifica que el proxy este levantado y responda. Usar cuando \
-                generate falla, para distinguir proxy caido de error de autenticacion.",
+            "description": "Check that the proxy is up and answering. Use it when generate \
+                fails, to tell a stopped proxy apart from an authentication error.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         },
         {
             "name": "usage",
-            "description": "Cuanto lleva consumido la cuenta de Grok en su ventana de plan \
-                (semanal), y cuando renueva. Es el limite que corta la generacion, no el \
-                conteo de tokens de una llamada. Usar antes de un trabajo largo, o cuando \
-                generate empieza a fallar por limite.",
+            "description": "How much of its plan window (weekly) the Grok account has used, \
+                and when that window renews. This is the limit that stops generation, not \
+                the token count of a single call. Use it before a long job, or when \
+                generate starts failing on limits.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }
     ])
@@ -383,16 +386,12 @@ pub fn dispatch(request: &Value, backend: &dyn Backend) -> Option<Value> {
                         Err(message) => tool_text(message, true),
                     },
                 )),
-                other => Some(rpc_error(
-                    id,
-                    -32602,
-                    format!("Herramienta desconocida: {other}"),
-                )),
+                other => Some(rpc_error(id, -32602, format!("Unknown tool: {other}"))),
             }
         }
         // Notifications have no id and get no reply.
         _ if method.starts_with("notifications/") => None,
-        other => id.map(|id| rpc_error(id, -32601, format!("Metodo no implementado: {other}"))),
+        other => id.map(|id| rpc_error(id, -32601, format!("Method not implemented: {other}"))),
     }
 }
 
@@ -410,7 +409,7 @@ pub fn serve_stdio(port: u16) -> anyhow::Result<()> {
         let request: Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("mcp: linea invalida: {error}");
+                eprintln!("mcp: invalid line: {error}");
                 continue;
             }
         };
@@ -442,7 +441,7 @@ mod tests {
             "mock".into()
         }
         fn usage(&self) -> Result<String, String> {
-            Ok("Grok · ventana semanal: 18% consumido".into())
+            Ok("Grok · weekly window: 18% used".into())
         }
     }
 
@@ -489,13 +488,13 @@ mod tests {
             response["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("ventana semanal")
+                .contains("weekly window")
         );
     }
 
     #[test]
     fn unknown_tool_is_a_protocol_error() {
-        let response = call("inexistente", json!({}));
+        let response = call("does-not-exist", json!({}));
         assert_eq!(response["error"]["code"], -32602);
     }
 
@@ -514,7 +513,7 @@ mod tests {
             response["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("prompt es obligatorio")
+                .contains("prompt is required")
         );
     }
 
@@ -522,8 +521,8 @@ mod tests {
     fn request_body_only_carries_fields_the_proxy_accepts() {
         let body = build_request_body(
             &json!({
-                "prompt": "hola",
-                "system": "sos guionista",
+                "prompt": "hello",
+                "system": "you are a screenwriter",
                 "temperature": 0.7,
                 "max_tokens": 900,
             }),
@@ -534,8 +533,8 @@ mod tests {
         assert_eq!(body["model"], "grok-4.5");
         assert_eq!(body["max_tokens"], 900);
         assert_eq!(body["stream"], false);
-        assert_eq!(body["system"], "sos guionista");
-        assert_eq!(body["messages"][0]["content"], "hola");
+        assert_eq!(body["system"], "you are a screenwriter");
+        assert_eq!(body["messages"][0]["content"], "hello");
 
         let keys: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
         for key in &keys {
@@ -549,7 +548,7 @@ mod tests {
                     "temperature"
                 ]
                 .contains(&key.as_str()),
-                "campo inesperado: {key}"
+                "unexpected field: {key}"
             );
         }
     }
@@ -557,17 +556,17 @@ mod tests {
     #[test]
     fn configured_default_applies_but_an_explicit_model_wins() {
         let body =
-            build_request_body(&json!({"prompt": "hola"}), "grok-composer-2.5-fast").unwrap();
+            build_request_body(&json!({"prompt": "hello"}), "grok-composer-2.5-fast").unwrap();
         assert_eq!(body["model"], "grok-composer-2.5-fast");
 
-        let body = build_request_body(&json!({"prompt": "hola", "model": "grok-4.5"}), "grok-4.5")
+        let body = build_request_body(&json!({"prompt": "hello", "model": "grok-4.5"}), "grok-4.5")
             .unwrap();
         assert_eq!(body["model"], "grok-4.5");
     }
 
     #[test]
     fn request_body_omits_absent_optionals() {
-        let body = build_request_body(&json!({"prompt": "hola"}), "grok-4.5").unwrap();
+        let body = build_request_body(&json!({"prompt": "hello"}), "grok-4.5").unwrap();
         assert!(body.get("system").is_none());
         assert!(body.get("temperature").is_none());
         assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
@@ -576,11 +575,11 @@ mod tests {
     #[test]
     fn rejects_models_outside_the_grok_allowlist() {
         let error = build_request_body(
-            &json!({"prompt": "hola", "model": "gpt-5.6-sol"}),
+            &json!({"prompt": "hello", "model": "gpt-5.6-sol"}),
             "grok-4.5",
         )
         .expect_err("must reject");
-        assert!(error.contains("Modelo no soportado"));
+        assert!(error.contains("Unsupported model"));
     }
 
     #[test]
@@ -588,41 +587,40 @@ mod tests {
         assert!(build_request_body(&json!({"prompt": "a", "temperature": 9}), "grok-4.5").is_err());
         assert!(build_request_body(&json!({"prompt": "a", "max_tokens": 0}), "grok-4.5").is_err());
         assert!(
-            build_request_body(&json!({"prompt": "a", "max_tokens": "muchos"}), "grok-4.5")
-                .is_err()
+            build_request_body(&json!({"prompt": "a", "max_tokens": "many"}), "grok-4.5").is_err()
         );
     }
 
     #[test]
     fn usage_travels_in_its_own_block_after_the_text() {
-        let response = call("generate", json!({"prompt": "hola"}));
+        let response = call("generate", json!({"prompt": "hello"}));
         let content = response["result"]["content"].as_array().unwrap();
 
         assert_eq!(content.len(), 2);
         // The text block must stay free of accounting noise.
-        assert!(!content[0]["text"].as_str().unwrap().contains("[uso]"));
+        assert!(!content[0]["text"].as_str().unwrap().contains("[usage]"));
         let usage = content[1]["text"].as_str().unwrap();
-        assert!(usage.contains("entrada=248"), "{usage}");
-        assert!(usage.contains("salida=825"), "{usage}");
+        assert!(usage.contains("input=248"), "{usage}");
+        assert!(usage.contains("output=825"), "{usage}");
         assert_eq!(response["result"]["isError"], false);
     }
 
     #[test]
     fn a_truncated_generation_says_so_in_the_usage_line() {
         let generation = Generation {
-            text: "escena a medio".into(),
+            text: "half a scene".into(),
             input_tokens: Some(10),
             output_tokens: Some(4096),
             stop_reason: Some("max_tokens".into()),
         };
         let usage = generation.usage_line().unwrap();
-        assert!(usage.contains("truncada"), "{usage}");
+        assert!(usage.contains("truncated"), "{usage}");
     }
 
     #[test]
     fn usage_block_is_omitted_when_the_proxy_reports_nothing() {
         let generation = Generation {
-            text: "texto".into(),
+            text: "text".into(),
             input_tokens: None,
             output_tokens: None,
             stop_reason: None,
@@ -635,12 +633,12 @@ mod tests {
     #[test]
     fn extracts_usage_and_stop_reason_alongside_the_text() {
         let payload = json!({
-            "content": [{"type": "text", "text": "hola"}],
+            "content": [{"type": "text", "text": "hello"}],
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 12, "output_tokens": 34}
         });
         let generation = extract_generation(&payload).unwrap();
-        assert_eq!(generation.text, "hola");
+        assert_eq!(generation.text, "hello");
         assert_eq!(generation.input_tokens, Some(12));
         assert_eq!(generation.output_tokens, Some(34));
         assert_eq!(generation.stop_reason.as_deref(), Some("end_turn"));
@@ -649,13 +647,13 @@ mod tests {
     #[test]
     fn extracts_and_joins_text_blocks_only() {
         let payload = json!({"content": [
-            {"type": "thinking", "text": "ignorame"},
-            {"type": "text", "text": "Escena 1. "},
-            {"type": "text", "text": "Marta entra."}
+            {"type": "thinking", "text": "ignore me"},
+            {"type": "text", "text": "Scene 1. "},
+            {"type": "text", "text": "Marta walks in."}
         ]});
         assert_eq!(
             extract_generation(&payload).unwrap().text,
-            "Escena 1. Marta entra."
+            "Scene 1. Marta walks in."
         );
     }
 

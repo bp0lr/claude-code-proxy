@@ -1536,7 +1536,7 @@ mod tests {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
             "max_tokens":100,
-            "messages":[{"role":"user","content":"hola"}],
+            "messages":[{"role":"user","content":"hello"}],
             "temperature": 0.8
         }))
         .unwrap();
@@ -1549,7 +1549,7 @@ mod tests {
     fn grok_translation_omits_temperature_when_absent() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
-            "messages":[{"role":"user","content":"hola"}]
+            "messages":[{"role":"user","content":"hello"}]
         }))
         .unwrap();
         let translated =
@@ -1561,7 +1561,7 @@ mod tests {
     fn grok_translation_rejects_out_of_range_temperature() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
-            "messages":[{"role":"user","content":"hola"}],
+            "messages":[{"role":"user","content":"hello"}],
             "temperature": 7
         }))
         .unwrap();
@@ -1574,7 +1574,7 @@ mod tests {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
             "max_tokens":256,
-            "messages":[{"role":"user","content":"Escribi una escena breve."}]
+            "messages":[{"role":"user","content":"Write a short scene."}]
         }))
         .unwrap();
         let translated =

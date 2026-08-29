@@ -449,7 +449,7 @@ mod tests {
     /// already generated and already billed.
     #[test]
     fn grok_reducer_treats_incomplete_as_a_max_tokens_stop() {
-        let input = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"media escena\"}\n\ndata: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":20}}}\n\n";
+        let input = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"half a scene\"}\n\ndata: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":20}}}\n\n";
         let events = reduce_upstream_bytes(input).unwrap();
 
         let finish = events
@@ -467,7 +467,7 @@ mod tests {
         assert_eq!(finish, ("max_tokens".to_string(), 11, 20));
         assert!(
             events.iter().any(
-                |event| matches!(event, ReducerEvent::TextDelta(_, text) if text == "media escena")
+                |event| matches!(event, ReducerEvent::TextDelta(_, text) if text == "half a scene")
             ),
             "the partial text must survive: {events:?}"
         );

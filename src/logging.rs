@@ -333,16 +333,16 @@ mod tests {
         assert_eq!(end, 3999);
         let _ = &text[..end];
 
-        assert_eq!(floor_char_boundary("hola", 10), 4);
+        assert_eq!(floor_char_boundary("text", 10), 4);
         assert_eq!(floor_char_boundary("ñ", 1), 0);
     }
 
     #[test]
     fn truncation_keeps_short_strings_intact() {
-        let Value::String(redacted) = redact_value(Value::String("hola ñandú".into())) else {
+        let Value::String(redacted) = redact_value(Value::String("plain café".into())) else {
             panic!("expected a string");
         };
-        assert_eq!(redacted, "hola ñandú");
+        assert_eq!(redacted, "plain café");
     }
 
     #[test]
