@@ -4229,13 +4229,17 @@ mod tests {
             }
         });
 
+        // The keepalive interval has to clear the platform timer granularity
+        // (~15ms on Windows) several times over, otherwise the pings this test
+        // counts are quantized away and the assertion fails without the
+        // response-start deadline having changed at all.
         let error = match collect_ws_events_with_keepalive_interval(
             &mut client,
-            50,
+            400,
             None,
             None,
             None,
-            Duration::from_millis(10),
+            Duration::from_millis(50),
         )
         .await
         {

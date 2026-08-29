@@ -2527,7 +2527,12 @@ mod tests {
             .await
         });
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), replacement_accepted_rx)
+        // The retry that opens the replacement connection waits out a real
+        // backoff (~1.5s for the first attempt) before it reconnects, so this
+        // budget only has to be comfortably longer than that schedule plus a
+        // loopback handshake. A tight bound turns a slow debug build into a
+        // spurious failure without testing anything extra.
+        tokio::time::timeout(std::time::Duration::from_secs(15), replacement_accepted_rx)
             .await
             .expect("replacement startup did not reach the blocked handshake")
             .expect("replacement startup acknowledgement sender dropped");
