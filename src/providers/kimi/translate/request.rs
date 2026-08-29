@@ -44,12 +44,15 @@ pub struct KimiThinking {
     pub kind: String,
 }
 
+/// Each variant carries its own wire string. An untagged enum serializes a
+/// *unit* variant as `null`, so `none` and `required` used to reach Kimi as
+/// `"tool_choice": null` — the client's policy silently dropped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum KimiToolChoice {
-    Auto,
-    None,
-    Required,
+    Auto(String),
+    None(String),
+    Required(String),
     Function {
         #[serde(rename = "type")]
         kind: String,
@@ -160,7 +163,7 @@ pub fn translate_request(
     };
 
     // Collapse auto tool_choice to None (default behavior)
-    if matches!(out.tool_choice, Some(KimiToolChoice::Auto)) {
+    if matches!(out.tool_choice, Some(KimiToolChoice::Auto(_))) {
         out.tool_choice = None;
     }
 
@@ -205,9 +208,9 @@ fn map_reasoning_effort(effort: Option<&str>, k3: bool) -> String {
 
 fn map_tool_choice(choice: &serde_json::Map<String, Value>) -> KimiToolChoice {
     match choice.get("type").and_then(|v| v.as_str()) {
-        Some("auto") => KimiToolChoice::Auto,
-        Some("none") => KimiToolChoice::None,
-        Some("any") => KimiToolChoice::Required,
+        Some("auto") => KimiToolChoice::Auto("auto".to_string()),
+        Some("none") => KimiToolChoice::None("none".to_string()),
+        Some("any") => KimiToolChoice::Required("required".to_string()),
         Some("tool") => {
             if let Some(name) = choice.get("name").and_then(|v| v.as_str()) {
                 KimiToolChoice::Function {
@@ -217,10 +220,10 @@ fn map_tool_choice(choice: &serde_json::Map<String, Value>) -> KimiToolChoice {
                     },
                 }
             } else {
-                KimiToolChoice::Required
+                KimiToolChoice::Required("required".to_string())
             }
         }
-        _ => KimiToolChoice::Auto,
+        _ => KimiToolChoice::Auto("auto".to_string()),
     }
 }
 
@@ -228,10 +231,10 @@ fn read_tool_choice(req: &MessagesRequest) -> Result<Option<KimiToolChoice>, any
     match req.extra.get("tool_choice") {
         Some(Value::Object(choice)) => Ok(Some(map_tool_choice(choice))),
         Some(Value::String(s)) => Ok(Some(match s.as_str() {
-            "auto" => KimiToolChoice::Auto,
-            "none" => KimiToolChoice::None,
-            "any" | "required" => KimiToolChoice::Required,
-            _ => KimiToolChoice::Auto,
+            "auto" => KimiToolChoice::Auto("auto".to_string()),
+            "none" => KimiToolChoice::None("none".to_string()),
+            "any" | "required" => KimiToolChoice::Required("required".to_string()),
+            _ => KimiToolChoice::Auto("auto".to_string()),
         })),
         _ => Ok(None),
     }
@@ -991,8 +994,36 @@ mod tests {
         let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
         assert!(matches!(
             translated.tool_choice,
-            Some(KimiToolChoice::Required)
+            Some(KimiToolChoice::Required(_))
         ));
+    }
+
+    /// Every other tool_choice assertion checks the Rust variant, which stays
+    /// correct even when the serialized form does not.
+    #[test]
+    fn tool_choice_reaches_the_wire_as_a_string() {
+        for (requested, expected) in [("none", "none"), ("any", "required"), ("tool", "function")] {
+            let mut choice = json!({"type": requested});
+            if requested == "tool" {
+                choice["name"] = json!("search");
+            }
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model": "kimi-for-coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name":"search","input_schema":{"type":"object"}}],
+                "tool_choice": choice
+            }))
+            .unwrap();
+            let translated =
+                translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+            let wire = serde_json::to_value(&translated).unwrap();
+            if requested == "tool" {
+                assert_eq!(wire["tool_choice"]["type"], expected);
+                assert_eq!(wire["tool_choice"]["function"]["name"], "search");
+            } else {
+                assert_eq!(wire["tool_choice"], expected, "requested {requested}");
+            }
+        }
     }
 
     #[test]
