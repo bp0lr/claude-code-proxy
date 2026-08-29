@@ -462,7 +462,7 @@ pub fn responses_response(
         "status":if incomplete { "incomplete" } else { "completed" },
         "model":model,
         "output":output,
-        "parallel_tool_calls":false,
+        "parallel_tool_calls":response_metadata.parallel_tool_calls,
         "tool_choice":response_metadata.tool_choice,
         "tools":response_metadata.tools,
         "error":null,

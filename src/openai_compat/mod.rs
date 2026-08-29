@@ -34,6 +34,10 @@ impl OpenAiSurface {
 pub struct OpenAiResponseMetadata {
     pub tools: Vec<Value>,
     pub tool_choice: Value,
+    /// Echoed back on every Responses envelope. `true` is the OpenAI default
+    /// for an omitted field, so a caller that never sets it still reads the
+    /// setting the request actually ran under.
+    pub parallel_tool_calls: bool,
 }
 
 impl Default for OpenAiResponseMetadata {
@@ -41,6 +45,7 @@ impl Default for OpenAiResponseMetadata {
         Self {
             tools: Vec::new(),
             tool_choice: json!("auto"),
+            parallel_tool_calls: true,
         }
     }
 }
