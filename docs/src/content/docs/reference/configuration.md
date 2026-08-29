@@ -133,7 +133,6 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | `CCP_GROK_BASE_URL` | `grok.baseUrl` | `https://cli-chat-proxy.grok.com/v1` | Changes the Responses API base URL. |
 | `CCP_GROK_CLIENT_VERSION` | `grok.clientVersion` | `0.2.93` | Changes the Grok client version header. |
 | `CCP_GROK_MODEL` | `grok.model` | `grok-4.5` | Selects the Grok model used when a request does not name one. |
-| `CCP_GROK_USAGE_ON_START` | `grok.usageOnStart` | `true` | Prints the Grok plan window on the launch banner. Set `0`, `false`, or `no` to hide it. |
 | `CCP_GROK_TOOL_IMAGE` | none | `omit` | Selects `omit`, `reattach`, `inline`, or `reject` image handling. |
 | `CCP_GROK_HOSTED_SEARCH` | none | off | Set to `1`, `on`, or `true` to let hosted search tools replace the caller's own search tools and force them on an explicit search turn. |
 | `CCP_GROK_SEARCH_BLOCKS` | none | `text` | Selects how a hosted search is reported: `text` for a text block, `native` for `server_tool_use` plus a `*_tool_result` block. |

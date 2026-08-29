@@ -405,10 +405,6 @@ local copy; it does not revoke anything upstream.
 `CCP_OPENCODE_API_KEY` (preferred), `OPENCODE_API_KEY`, or `"opencode":
 {"apiKey": ...}` in `config.json`.
 
-**Grok extra:** `claude-code-proxy grok usage` reports how much of the account's
-plan window is consumed and when it renews — the limit that actually stops
-generation, distinct from per-request token counts. Also at `GET /usage`.
-
 ---
 
 ## 7. Proxy-side configuration
@@ -466,9 +462,9 @@ otherwise stays as it is.
 claude-code-proxy mcp          # stdio, JSON-RPC 2.0, spawned by the client
 ```
 
-Tools: `generate` (text from Grok), `status` (is the proxy up), `usage` (plan
-window). It reaches Grok **through the running proxy**, so the proxy must be up
-for `generate` and `usage`; `status` is what tells you whether it is.
+Tools: `generate` (text from Grok) and `status` (is the proxy up). It reaches
+Grok **through the running proxy**, so the proxy must be up for `generate`;
+`status` is what tells you whether it is.
 
 Per-project registration — `.mcp.json` at the project root, committed:
 
@@ -542,9 +538,9 @@ Incoming bearer credentials are ignored; the stored provider login is used.
 Unsupported non-null fields return `invalid_request_error` naming the field in
 `error.param` rather than being silently dropped.
 
-Other routes: `GET /healthz`, `GET /v1/models`, `POST /v1/messages/count_tokens`
-(local estimate, not a billing count), `GET /usage` (Grok plan window). Optional
-image and transcription routes exist behind their own flags.
+Other routes: `GET /healthz`, `GET /v1/models`, and
+`POST /v1/messages/count_tokens` (a local estimate, not a billing count).
+Optional image and transcription routes exist behind their own flags.
 
 ---
 

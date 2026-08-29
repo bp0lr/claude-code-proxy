@@ -4,7 +4,6 @@ use claude_code_proxy::{
     config, logging,
     monitor::MonitorHandle,
     paths,
-    providers::grok::billing as grok_billing,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
     server::{self, ServerConfig},
     tui::{self, MonitorExit, MonitorUiConfig},
@@ -68,10 +67,10 @@ enum Commands {
         #[command(subcommand)]
         command: ProviderGroup,
     },
-    /// Manage Grok authentication and inspect plan usage
+    /// Manage Grok authentication
     Grok {
         #[command(subcommand)]
-        command: GrokGroup,
+        command: ProviderGroup,
     },
 }
 
@@ -80,22 +79,6 @@ enum ProviderGroup {
     Auth {
         #[command(subcommand)]
         command: claude_code_proxy::provider::AuthCommand,
-    },
-}
-
-/// Grok carries an extra command the other providers have no equivalent for,
-/// so it gets its own group instead of putting a dead entry on all of them.
-#[derive(Debug, Subcommand)]
-enum GrokGroup {
-    Auth {
-        #[command(subcommand)]
-        command: claude_code_proxy::provider::AuthCommand,
-    },
-    /// Show how much of the plan window the account has consumed
-    Usage {
-        /// Print the raw JSON instead of the summary
-        #[arg(long)]
-        json: bool,
     },
 }
 
@@ -127,9 +110,6 @@ fn main() -> Result<()> {
             match select_serve_mode(std::io::stdout().is_terminal(), no_monitor) {
                 ServeMode::Plain => {
                     print_server_banner(&bind_address, effective_port, &registry);
-                    if config::grok_usage_on_start() {
-                        spawn_grok_usage_banner(&runtime);
-                    }
                     runtime
                         .block_on(server::serve(ServerConfig {
                             bind_address,
@@ -158,8 +138,6 @@ fn main() -> Result<()> {
                         let _ = shutdown_complete_tx.send(());
                         result
                     });
-                    let plan_usage =
-                        config::grok_usage_on_start().then(|| spawn_plan_usage_refresher(&runtime));
                     let ui_result = tui::run_monitor(
                         monitor,
                         MonitorUiConfig {
@@ -168,7 +146,6 @@ fn main() -> Result<()> {
                             registry: &registry,
                             shutdown: Some(shutdown_tx),
                             shutdown_complete: Some(shutdown_complete_rx),
-                            plan_usage,
                         },
                     );
                     if matches!(&ui_result, Ok(MonitorExit::ForceQuit)) {
@@ -198,12 +175,7 @@ fn main() -> Result<()> {
         Commands::Codex { command } => run_provider_cli("codex", command),
         Commands::Kimi { command } => run_provider_cli("kimi", command),
         Commands::Cursor { command } => run_provider_cli("cursor", command),
-        Commands::Grok { command } => match command {
-            GrokGroup::Auth { command } => {
-                run_provider_cli("grok", ProviderGroup::Auth { command })
-            }
-            GrokGroup::Usage { json } => run_grok_usage(json),
-        },
+        Commands::Grok { command } => run_provider_cli("grok", command),
     }
 }
 
@@ -219,92 +191,6 @@ fn select_serve_mode(stdout_is_tty: bool, no_monitor: bool) -> ServeMode {
     } else {
         ServeMode::Plain
     }
-}
-
-fn run_grok_usage(as_json: bool) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let usage = match runtime.block_on(grok_billing::fetch_account_usage()) {
-        Ok(usage) => usage,
-        Err(err) => {
-            eprintln!("{err}");
-            std::process::exit(2);
-        }
-    };
-    if as_json {
-        println!("{}", serde_json::to_string_pretty(&usage.to_json())?);
-    } else {
-        println!("{}", usage.summary());
-    }
-    Ok(())
-}
-
-/// Polls the plan window for the monitor header. The window moves over days,
-/// so a slow cadence is plenty; the point is that a session left open for
-/// hours does not keep showing the number it started with.
-fn spawn_plan_usage_refresher(
-    runtime: &tokio::runtime::Runtime,
-) -> std::sync::mpsc::Receiver<String> {
-    const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
-
-    let (sender, receiver) = std::sync::mpsc::channel();
-    runtime.spawn(async move {
-        // The monitor suppresses stderr, so this only lands in the log file —
-        // which is the point: a header that never appears otherwise leaves no
-        // trace of why.
-        let log = logging::create_logger("grok");
-        let mut last_failure: Option<String> = None;
-        loop {
-            match grok_billing::fetch_account_usage().await {
-                Ok(usage) => {
-                    last_failure = None;
-                    if sender.send(usage.compact()).is_err() {
-                        // The monitor is gone; nothing left to report to.
-                        return;
-                    }
-                }
-                Err(err) => {
-                    // Report a change in the failure, not every tick: a
-                    // logged-out session would otherwise fill the log with the
-                    // same line every five minutes.
-                    let message = err.to_string();
-                    if last_failure.as_deref() != Some(message.as_str()) {
-                        log.warn(
-                            "grok plan usage refresh failed",
-                            Some(serde_json::Map::from_iter([(
-                                "error".to_string(),
-                                serde_json::json!(&message),
-                            )])),
-                        );
-                        last_failure = Some(message);
-                    }
-                }
-            }
-            tokio::time::sleep(REFRESH_INTERVAL).await;
-        }
-    });
-    receiver
-}
-
-/// The plan window is the context that decides whether a long job is even
-/// worth starting, so the launch banner shows it. Best effort by design: a
-/// slow or failed lookup prints nothing. It runs on the runtime rather than
-/// blocking it, because otherwise a slow network delays the listener by up to
-/// the timeout and a client launched alongside the proxy gets a refused
-/// connection.
-fn spawn_grok_usage_banner(runtime: &tokio::runtime::Runtime) {
-    runtime.spawn(async {
-        let fetched = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            grok_billing::fetch_account_usage(),
-        )
-        .await;
-        if let Ok(Ok(usage)) = fetched {
-            println!("{}", usage.summary());
-            println!();
-        }
-    });
 }
 
 fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {

@@ -3,9 +3,8 @@ setlocal
 
 rem Runs the MCP server this binary ships natively, on stdio. It replaces the
 rem standalone grok-mcp.ts from the previous program: same protocol, same
-rem generate and status tools, plus a usage tool for the account plan window,
-rem and it reuses this project's own translation path instead of a second
-rem implementation that has to be kept in step.
+rem generate and status tools, and it reuses this project's own translation
+rem path instead of a second implementation that has to be kept in step.
 rem
 rem MCP clients spawn this file; they do not run it interactively. Point the
 rem client at the absolute path of this file with no arguments.

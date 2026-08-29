@@ -19,25 +19,6 @@ Liveness check:
 
 It does not verify provider credentials or upstream availability.
 
-## `GET /usage`
-
-How much of the Grok plan window the account has consumed, and when it renews:
-
-```json
-{
-  "provider": "grok",
-  "used_percent": 18.4,
-  "window": {"kind": "weekly", "start": "…", "end": "…", "resets_in_seconds": 527000},
-  "products": [{"product": "…", "used_percent": 18.4}],
-  "on_demand": {"used": null, "cap": null},
-  "prepaid_balance": null
-}
-```
-
-`GET /usage?format=text` returns the same figure as the one-line summary the CLI prints. Fields whose shape xAI changes degrade to `null` rather than failing the lookup.
-
-This is the account limit that stops generation, not the per-request token counts the monitor reports. It is Grok-specific and needs a Grok login; a failed lookup returns HTTP 502. Each call reaches xAI, so it is not a route to poll.
-
 ## `POST /v1/messages`
 
 Accepts an Anthropic Messages request in streaming or non-streaming mode. `POST /v1/messages?beta=true` reaches the same route.

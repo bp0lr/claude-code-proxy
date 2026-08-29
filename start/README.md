@@ -40,7 +40,7 @@ and optionally to a file.
 
 Wrapper around `claude-code-proxy mcp`, the MCP server built into this binary.
 MCP clients spawn it over stdio; it is not meant to be run interactively. It
-exposes `generate`, `status` and `usage`.
+exposes `generate` and `status`.
 
 ```json
 {
@@ -52,5 +52,5 @@ exposes `generate`, `status` and `usage`.
 }
 ```
 
-The proxy has to be running for `generate` and `usage` to answer; `status` is
-what tells you whether it is.
+The proxy has to be running for `generate` to answer; `status` is what tells
+you whether it is.

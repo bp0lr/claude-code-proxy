@@ -18,9 +18,6 @@ description: Release notes for claude-code-proxy.
 
 - Grok accepts `grok-4.6`, and `CCP_GROK_MODEL` / `grok.model` selects the model
   used when a request does not name one.
-- Grok account plan usage is available through `claude-code-proxy grok usage`,
-  `GET /usage`, the MCP `usage` tool, the monitor header, and the launch banner.
-  `CCP_GROK_USAGE_ON_START` or `grok.usageOnStart` turns the banner off.
 - Traffic captures and error captures keep only their newest 200 entries, so
   leaving `CCP_TRAFFIC_LOG=1` on no longer grows the state directory without
   bound. A capture that is still being written is never evicted.

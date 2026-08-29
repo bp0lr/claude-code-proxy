@@ -56,8 +56,6 @@ impl Generation {
 pub trait Backend {
     fn generate(&self, args: &Value) -> Result<Generation, String>;
     fn status(&self) -> String;
-    /// How much of the Grok plan window the account has burned through.
-    fn usage(&self) -> Result<String, String>;
 }
 
 pub struct HttpBackend {
@@ -77,10 +75,6 @@ impl HttpBackend {
 
     fn messages_url(&self) -> String {
         format!("http://127.0.0.1:{}/v1/messages", self.port)
-    }
-
-    fn usage_url(&self) -> String {
-        format!("http://127.0.0.1:{}/usage?format=text", self.port)
     }
 
     fn unreachable(&self, reason: &str) -> String {
@@ -242,24 +236,6 @@ impl Backend for HttpBackend {
             Err(error) => self.unreachable(&error.to_string()),
         }
     }
-
-    fn usage(&self) -> Result<String, String> {
-        let response = self
-            .client
-            .get(self.usage_url())
-            .timeout(Duration::from_secs(30))
-            .send()
-            .map_err(|error| self.unreachable(&error.to_string()))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .map_err(|error| format!("Could not read the proxy response: {error}"))?;
-        if !status.is_success() {
-            let payload: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            return Err(error_message(&payload, status.as_u16(), &body));
-        }
-        Ok(body.trim_end().to_string())
-    }
 }
 
 fn tool_definitions() -> Value {
@@ -307,14 +283,6 @@ fn tool_definitions() -> Value {
             "name": "status",
             "description": "Check that the proxy is up and answering. Use it when generate \
                 fails, to tell a stopped proxy apart from an authentication error.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-        },
-        {
-            "name": "usage",
-            "description": "How much of its plan window (weekly) the Grok account has used, \
-                and when that window renews. This is the limit that stops generation, not \
-                the token count of a single call. Use it before a long job, or when \
-                generate starts failing on limits.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }
     ])
@@ -370,13 +338,6 @@ pub fn dispatch(request: &Value, backend: &dyn Backend) -> Option<Value> {
 
             match name {
                 "status" => Some(result(id, tool_text(backend.status(), false))),
-                "usage" => Some(result(
-                    id,
-                    match backend.usage() {
-                        Ok(summary) => tool_text(summary, false),
-                        Err(message) => tool_text(message, true),
-                    },
-                )),
                 // Tool failures are reported as results with isError, not as
                 // JSON-RPC errors, so the model can see and react to them.
                 "generate" => Some(result(
@@ -440,9 +401,6 @@ mod tests {
         fn status(&self) -> String {
             "mock".into()
         }
-        fn usage(&self) -> Result<String, String> {
-            Ok("Grok · weekly window: 18% used".into())
-        }
     }
 
     fn call(name: &str, args: Value) -> Value {
@@ -468,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_generate_status_and_usage() {
+    fn tools_list_exposes_generate_and_status() {
         let request = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let response = dispatch(&request, &MockBackend).unwrap();
         let names: Vec<_> = response["result"]["tools"]
@@ -477,19 +435,7 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, vec!["generate", "status", "usage"]);
-    }
-
-    #[test]
-    fn usage_reports_the_plan_window() {
-        let response = call("usage", json!({}));
-        assert_eq!(response["result"]["isError"], false);
-        assert!(
-            response["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("weekly window")
-        );
+        assert_eq!(names, vec!["generate", "status"]);
     }
 
     #[test]
