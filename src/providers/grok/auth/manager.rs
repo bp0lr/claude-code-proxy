@@ -31,6 +31,22 @@ pub struct GrokAuthManager<S: AuthStorage<StoredAuth>> {
     refresh_lock: Arc<Mutex<()>>,
 }
 
+/// The refresh lock lives in the manager, so two managers over the same file
+/// serialize nothing: they can both see a stale token, both rotate it, and the
+/// loser's `save_auth` overwrites the winner's — logging the user out. Every
+/// caller that reads the on-disk Grok login has to go through this one.
+pub fn shared_file_auth_manager()
+-> anyhow::Result<Arc<GrokAuthManager<crate::auth::FileAuthStore<StoredAuth>>>> {
+    static SHARED: std::sync::OnceLock<
+        Arc<GrokAuthManager<crate::auth::FileAuthStore<StoredAuth>>>,
+    > = std::sync::OnceLock::new();
+    if let Some(manager) = SHARED.get() {
+        return Ok(manager.clone());
+    }
+    let manager = Arc::new(GrokAuthManager::new(super::token_store::file_store())?);
+    Ok(SHARED.get_or_init(|| manager).clone())
+}
+
 impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
     pub fn new(store: GrokTokenStore<S>) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()

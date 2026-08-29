@@ -128,7 +128,7 @@ fn main() -> Result<()> {
                 ServeMode::Plain => {
                     print_server_banner(&bind_address, effective_port, &registry);
                     if config::grok_usage_on_start() {
-                        print_grok_usage_banner(&runtime);
+                        spawn_grok_usage_banner(&runtime);
                     }
                     runtime
                         .block_on(server::serve(ServerConfig {
@@ -250,12 +250,36 @@ fn spawn_plan_usage_refresher(
 
     let (sender, receiver) = std::sync::mpsc::channel();
     runtime.spawn(async move {
+        // The monitor suppresses stderr, so this only lands in the log file —
+        // which is the point: a header that never appears otherwise leaves no
+        // trace of why.
+        let log = logging::create_logger("grok");
+        let mut last_failure: Option<String> = None;
         loop {
-            if let Ok(usage) = grok_billing::fetch_account_usage().await
-                && sender.send(usage.compact()).is_err()
-            {
-                // The monitor is gone; nothing left to report to.
-                return;
+            match grok_billing::fetch_account_usage().await {
+                Ok(usage) => {
+                    last_failure = None;
+                    if sender.send(usage.compact()).is_err() {
+                        // The monitor is gone; nothing left to report to.
+                        return;
+                    }
+                }
+                Err(err) => {
+                    // Report a change in the failure, not every tick: a
+                    // logged-out session would otherwise fill the log with the
+                    // same line every five minutes.
+                    let message = err.to_string();
+                    if last_failure.as_deref() != Some(message.as_str()) {
+                        log.warn(
+                            "grok plan usage refresh failed",
+                            Some(serde_json::Map::from_iter([(
+                                "error".to_string(),
+                                serde_json::json!(&message),
+                            )])),
+                        );
+                        last_failure = Some(message);
+                    }
+                }
             }
             tokio::time::sleep(REFRESH_INTERVAL).await;
         }
@@ -265,19 +289,22 @@ fn spawn_plan_usage_refresher(
 
 /// The plan window is the context that decides whether a long job is even
 /// worth starting, so the launch banner shows it. Best effort by design: a
-/// slow or failed lookup prints nothing and never holds up the server.
-fn print_grok_usage_banner(runtime: &tokio::runtime::Runtime) {
-    let fetched = runtime.block_on(async {
-        tokio::time::timeout(
+/// slow or failed lookup prints nothing. It runs on the runtime rather than
+/// blocking it, because otherwise a slow network delays the listener by up to
+/// the timeout and a client launched alongside the proxy gets a refused
+/// connection.
+fn spawn_grok_usage_banner(runtime: &tokio::runtime::Runtime) {
+    runtime.spawn(async {
+        let fetched = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             grok_billing::fetch_account_usage(),
         )
-        .await
+        .await;
+        if let Ok(Ok(usage)) = fetched {
+            println!("{}", usage.summary());
+            println!();
+        }
     });
-    if let Ok(Ok(usage)) = fetched {
-        println!("{}", usage.summary());
-        println!();
-    }
 }
 
 fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {

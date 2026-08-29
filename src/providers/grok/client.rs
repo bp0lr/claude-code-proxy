@@ -5,7 +5,7 @@ use futures_util::StreamExt;
 use http::StatusCode;
 
 use super::auth::manager::GrokAuthManager;
-use super::auth::token_store::{StoredAuth, file_store};
+use super::auth::token_store::StoredAuth;
 use super::translate::request::GrokResponsesRequest;
 use crate::traffic::TrafficCapture;
 
@@ -82,7 +82,7 @@ impl GrokClient {
                 .http2_keep_alive_while_idle(true)
                 .build()?,
         );
-        let auth = Arc::new(GrokAuthManager::new(file_store())?);
+        let auth = super::auth::manager::shared_file_auth_manager()?;
         Ok(Self::with_shared(
             url_for(base_url)?,
             client_version,

@@ -405,10 +405,16 @@ pub fn grok_model() -> String {
     "grok-4.5".to_string()
 }
 
+/// Defaults to on, so this is the one flag read as an opt-*out*. It still folds
+/// case and treats an empty value as "off", because `CCP_GROK_USAGE_ON_START=`
+/// and `=False` are both how people expect to turn a feature off.
 pub fn grok_usage_on_start() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_GROK_USAGE_ON_START") {
-        return !matches!(raw.trim(), "0" | "false" | "no");
+        return !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off" | "disabled"
+        );
     }
     read_file_config(&paths::config_dir())
         .and_then(|f| f.grok)

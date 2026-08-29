@@ -159,7 +159,12 @@ impl Provider for GrokProvider {
                         "invalid_response",
                         Some(&detail),
                     );
-                    log_upstream_failure(&ctx.req_id, "accumulate", "invalid_response", &detail);
+                    log_upstream_failure(
+                        &ctx.req_id,
+                        "accumulate",
+                        "invalid_response",
+                        Some(&detail),
+                    );
                     json_error(
                         StatusCode::BAD_GATEWAY,
                         "api_error",
@@ -436,8 +441,7 @@ where
     /// so the SSE error frame keeps the shape clients already parse.
     fn fail_with(&mut self, stage: &str, kind: &str, detail: Option<String>) -> Vec<u8> {
         self.error_sent = true;
-        let detail = detail.unwrap_or_else(|| kind.to_string());
-        log_upstream_failure(&self.req_id, stage, kind, &detail);
+        log_upstream_failure(&self.req_id, stage, kind, detail.as_deref());
         if let Some(capture) = self.stream_capture.as_mut() {
             capture.malformed(stage, kind);
             capture.downstream_event("error", serde_json::json!({"type":"error","error":{"type":"api_error","message":"Grok stream is invalid"}}));
@@ -531,16 +535,19 @@ fn write_error_detail(
 /// A failed upstream translation is the one thing worth a log line of its own:
 /// traffic capture is off by default, so without this the only trace left of a
 /// 502 is its status code.
-fn log_upstream_failure(req_id: &str, stage: &str, kind: &str, detail: &str) {
-    crate::logging::create_logger("grok").error(
-        "upstream_translation_failed",
-        Some(serde_json::Map::from_iter([
-            ("reqId".to_string(), serde_json::json!(req_id)),
-            ("stage".to_string(), serde_json::json!(stage)),
-            ("kind".to_string(), serde_json::json!(kind)),
-            ("detail".to_string(), serde_json::json!(detail)),
-        ])),
-    );
+/// `detail` is omitted rather than echoed from `kind` when there is no
+/// underlying cause, so a reader can tell "no further detail" apart from a
+/// detail that happens to repeat the kind.
+fn log_upstream_failure(req_id: &str, stage: &str, kind: &str, detail: Option<&str>) {
+    let mut fields = serde_json::Map::from_iter([
+        ("reqId".to_string(), serde_json::json!(req_id)),
+        ("stage".to_string(), serde_json::json!(stage)),
+        ("kind".to_string(), serde_json::json!(kind)),
+    ]);
+    if let Some(detail) = detail {
+        fields.insert("detail".to_string(), serde_json::json!(detail));
+    }
+    crate::logging::create_logger("grok").error("upstream_translation_failed", Some(fields));
 }
 
 fn grok_provider_error(error: client::GrokError) -> ProviderError {

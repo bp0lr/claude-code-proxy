@@ -15,8 +15,7 @@ use std::time::Duration;
 use jiff::{Timestamp, Zoned, tz::TimeZone};
 use serde_json::{Value, json};
 
-use super::auth::manager::GrokAuthManager;
-use super::auth::token_store::file_store;
+use super::auth::manager::shared_file_auth_manager;
 
 const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 const BILLING_QUERY: &str = "format=credits";
@@ -112,9 +111,9 @@ impl AccountUsage {
         let window = self
             .period
             .as_ref()
-            .map_or("ventana", |period| window_label(&period.kind));
+            .map_or("window", |period| window_label(&period.kind));
         let mut lines = vec![format!(
-            "Grok · {window}: {} consumido",
+            "Grok · {window}: {} used",
             self.used_percent
                 .map_or_else(|| "?%".to_string(), format_percent)
         )];
@@ -124,8 +123,8 @@ impl AccountUsage {
         {
             let renewal = Zoned::new(end, zone).strftime("%d/%m %H:%M").to_string();
             lines.push(match period.resets_in_seconds(now) {
-                Some(0) | None => format!("Renueva el {renewal}"),
-                Some(seconds) => format!("Renueva el {renewal} (faltan {})", format_span(seconds)),
+                Some(0) | None => format!("Renews {renewal}"),
+                Some(seconds) => format!("Renews {renewal} ({} left)", format_span(seconds)),
             });
         }
 
@@ -158,13 +157,13 @@ impl AccountUsage {
             && cap > 0.0
         {
             extras.push(format!(
-                "on-demand {} de {}",
+                "on-demand {} of {}",
                 format_amount(used),
                 format_amount(cap)
             ));
         }
         if let Some(balance) = self.prepaid_balance.filter(|balance| *balance > 0.0) {
-            extras.push(format!("saldo prepago {}", format_amount(balance)));
+            extras.push(format!("prepaid balance {}", format_amount(balance)));
         }
         if !extras.is_empty() {
             lines.push(extras.join(" · "));
@@ -174,42 +173,73 @@ impl AccountUsage {
     }
 }
 
-/// Reads the plan window straight from xAI. Needs a valid Grok login; the auth
-/// manager refreshes the token when it is close to expiring.
-pub async fn fetch_account_usage() -> anyhow::Result<AccountUsage> {
-    let url = billing_url(&crate::config::grok_base_url())?;
-    let auth = GrokAuthManager::new(file_store())?
-        .get_auth()
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!("Sin autenticacion de Grok. Corre: claude-code-proxy grok auth login")
-        })?;
-
+/// One client for the whole process. Building a `reqwest::Client` stands up a
+/// connection pool and a TLS stack, which is wasted work on a route that can be
+/// polled.
+fn billing_client() -> anyhow::Result<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(REQUEST_TIMEOUT)
         .build()?;
-    let response = client
+    Ok(CLIENT.get_or_init(|| client))
+}
+
+/// Reads the plan window straight from xAI. Needs a valid Grok login; the auth
+/// manager refreshes the token when it is close to expiring.
+pub async fn fetch_account_usage() -> anyhow::Result<AccountUsage> {
+    let url = billing_url(&crate::config::grok_base_url())?;
+    // The shared manager, not a private one: a second manager over the same
+    // token file would refresh concurrently with the request path and the
+    // rotated refresh token could be lost.
+    let auth = shared_file_auth_manager()?
+        .get_auth()
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "Not authenticated with Grok ({err}). Run: claude-code-proxy grok auth login"
+            )
+        })?;
+
+    let mut response = billing_client()?
         .get(url)
         .header("authorization", format!("Bearer {}", auth.access))
         .send()
         .await
-        .map_err(|_| anyhow::anyhow!("No se pudo contactar el endpoint de facturacion de Grok"))?;
+        .map_err(|err| anyhow::anyhow!("Could not reach the Grok billing endpoint: {err}"))?;
 
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
         anyhow::bail!(
-            "El endpoint de facturacion de Grok respondio HTTP {}",
+            "The Grok billing endpoint answered HTTP {}",
             status.as_u16()
         );
     }
-    if body.len() > MAX_RESPONSE_BYTES {
-        anyhow::bail!("La respuesta de facturacion de Grok excede el limite de tamano");
+    // Read incrementally so an upstream that answers with something enormous is
+    // cut off rather than buffered in full and rejected afterwards.
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        anyhow::bail!("The Grok billing response exceeds the size limit");
     }
-    let payload: Value = serde_json::from_str(&body)
-        .map_err(|_| anyhow::anyhow!("Respuesta de facturacion de Grok ilegible"))?;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| anyhow::anyhow!("Reading the Grok billing response was cut short: {err}"))?
+    {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            anyhow::bail!("The Grok billing response exceeds the size limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let payload: Value = serde_json::from_slice(&body)
+        .map_err(|err| anyhow::anyhow!("Unreadable Grok billing response: {err}"))?;
     Ok(parse_account_usage(&payload))
 }
 
@@ -221,7 +251,11 @@ fn billing_url(base_url: &str) -> anyhow::Result<String> {
     };
     let mut url = reqwest::Url::parse(base_url)?;
     let path = url.path().trim_end_matches('/');
-    url.set_path(&format!("{path}/billing"));
+    // An override that already points at the billing route stays as it is,
+    // matching how `responses_url` treats its own suffix.
+    if !path.ends_with("/billing") {
+        url.set_path(&format!("{path}/billing"));
+    }
     url.set_query(Some(BILLING_QUERY));
     Ok(url.to_string())
 }
@@ -276,11 +310,14 @@ fn parse_product(entry: &Value) -> Option<ProductUsage> {
 fn amount(value: Option<&Value>) -> Option<f64> {
     let value = value?;
     let inner = value.get("val").unwrap_or(value);
-    match inner {
+    let parsed = match inner {
         Value::Number(number) => number.as_f64(),
         Value::String(text) => text.trim().parse().ok(),
         _ => None,
-    }
+    };
+    // `"nan"` and `"inf"` parse successfully and would render as `NaN%`, which
+    // reads as a proxy bug rather than as the unknown value it is.
+    parsed.filter(|value| value.is_finite())
 }
 
 fn timestamp(value: &Value) -> Option<Timestamp> {
@@ -295,10 +332,10 @@ fn period_kind(raw: &str) -> String {
 
 fn window_label(kind: &str) -> &str {
     match kind {
-        "weekly" => "ventana semanal",
-        "monthly" => "ventana mensual",
-        "daily" => "ventana diaria",
-        _ => "ventana",
+        "weekly" => "weekly window",
+        "monthly" => "monthly window",
+        "daily" => "daily window",
+        _ => "window",
     }
 }
 
@@ -386,7 +423,7 @@ mod tests {
 
         assert_eq!(
             summary,
-            "Grok · ventana semanal: 18% consumido\nRenueva el 31/07 14:13 (faltan 6d 2h)"
+            "Grok · weekly window: 18% used\nRenews 31/07 14:13 (6d 2h left)"
         );
     }
 
@@ -426,7 +463,7 @@ mod tests {
 
         let summary = usage.summary_at(at("2026-07-25T12:00:00Z"), TimeZone::UTC);
         assert!(
-            summary.contains("on-demand 12.50 de 50 · saldo prepago 4"),
+            summary.contains("on-demand 12.50 of 50 · prepaid balance 4"),
             "{summary}"
         );
     }
@@ -438,7 +475,7 @@ mod tests {
         assert_eq!(usage, AccountUsage::default());
         assert_eq!(
             usage.summary_at(at("2026-07-25T12:00:00Z"), TimeZone::UTC),
-            "Grok · ventana: ?% consumido"
+            "Grok · window: ?% used"
         );
     }
 
@@ -454,7 +491,7 @@ mod tests {
         assert!(
             !usage
                 .summary_at(at("2026-08-02T00:00:00Z"), TimeZone::UTC)
-                .contains("faltan")
+                .contains("left)")
         );
     }
 
