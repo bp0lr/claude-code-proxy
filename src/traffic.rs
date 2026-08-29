@@ -15,6 +15,10 @@ pub struct TrafficCapture {
     event_counter: Mutex<usize>,
 }
 
+/// Request directories kept under `traffic/`. Enough to debug a session's
+/// worth of failures, bounded enough that leaving capture on is not a slow
+/// disk leak.
+pub const MAX_TRAFFIC_CAPTURES: usize = 200;
 pub const MAX_SSE_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_STREAM_CAPTURE_EVENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_STREAM_CAPTURE_EVENTS: usize = 1_024;
@@ -44,10 +48,11 @@ pub fn create_traffic_capture(opts: TrafficCaptureOptions) -> Option<TrafficCapt
     if !traffic_capture_enabled() {
         return None;
     }
-    let state_root = opts
+    let traffic_root = opts
         .state_dir_override
         .unwrap_or_else(paths::state_dir)
-        .join("traffic")
+        .join("traffic");
+    let state_root = traffic_root
         .join(sanitize_path_part(
             opts.session_id.as_deref().unwrap_or("no-session"),
         ))
@@ -57,12 +62,57 @@ pub fn create_traffic_capture(opts: TrafficCaptureOptions) -> Option<TrafficCapt
             sanitize_path_part(opts.provider.as_deref().unwrap_or("unknown-provider")),
             sanitize_path_part(&opts.req_id),
         ));
+    prune_traffic_captures(&traffic_root);
 
     Some(TrafficCapture {
         root: state_root,
         artifact_counter: Mutex::new(0),
         event_counter: Mutex::new(0),
     })
+}
+
+/// Capture is a debugging switch that is easy to leave on, and every request
+/// writes a directory holding full prompts and responses. Without a cap the
+/// state directory grows until the disk complains, so only the newest captures
+/// survive — the same treatment the logs and error captures already get.
+fn prune_traffic_captures(traffic_root: &Path) {
+    let Ok(sessions) = fs::read_dir(traffic_root) else {
+        return;
+    };
+    let sessions: Vec<PathBuf> = sessions
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+
+    let mut captures: Vec<(std::time::SystemTime, PathBuf)> = sessions
+        .iter()
+        .filter_map(|session| fs::read_dir(session).ok())
+        .flat_map(|entries| entries.flatten())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter_map(|path| {
+            let modified = path.metadata().and_then(|meta| meta.modified()).ok()?;
+            Some((modified, path))
+        })
+        .collect();
+
+    if captures.len() > MAX_TRAFFIC_CAPTURES {
+        // Request directories are not named by time, so age comes from the
+        // filesystem rather than from sorting the names.
+        captures.sort_by_key(|(modified, _)| *modified);
+        let excess = captures.len() - MAX_TRAFFIC_CAPTURES;
+        for (_, stale) in captures.into_iter().take(excess) {
+            let _ = fs::remove_dir_all(stale);
+        }
+    }
+
+    // A session directory left with nothing in it is pure noise.
+    for session in sessions {
+        if fs::read_dir(&session).is_ok_and(|mut entries| entries.next().is_none()) {
+            let _ = fs::remove_dir(session);
+        }
+    }
 }
 
 impl TrafficCapture {
@@ -421,4 +471,86 @@ fn set_mode(path: &Path, mode: u32) {
 #[allow(dead_code)]
 fn _provider_alias(_provider: &str) -> Option<AliasProvider> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn capture_dir(root: &Path, session: &str, index: usize) {
+        let path = root.join(session).join(format!("{index:06}-grok-req"));
+        create_dir_all(&path).unwrap();
+        // A real capture is never an empty directory.
+        fs::write(path.join("000-metadata.json"), b"{}").unwrap();
+    }
+
+    fn request_dirs(root: &Path) -> usize {
+        fs::read_dir(root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|session| fs::read_dir(session.path()).ok())
+            .flat_map(|entries| entries.flatten())
+            .filter(|entry| entry.path().is_dir())
+            .count()
+    }
+
+    #[test]
+    fn pruning_holds_the_capture_directory_at_the_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("traffic");
+        for index in 0..MAX_TRAFFIC_CAPTURES + 10 {
+            capture_dir(&root, "session-a", index);
+        }
+
+        prune_traffic_captures(&root);
+
+        assert_eq!(request_dirs(&root), MAX_TRAFFIC_CAPTURES);
+    }
+
+    #[test]
+    fn pruning_counts_captures_across_every_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("traffic");
+        for index in 0..MAX_TRAFFIC_CAPTURES {
+            capture_dir(&root, "session-a", index);
+        }
+        for index in 0..20 {
+            capture_dir(&root, "session-b", index);
+        }
+
+        prune_traffic_captures(&root);
+
+        assert_eq!(request_dirs(&root), MAX_TRAFFIC_CAPTURES);
+    }
+
+    #[test]
+    fn a_session_left_without_captures_is_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("traffic");
+        create_dir_all(root.join("session-vacia")).unwrap();
+        capture_dir(&root, "session-viva", 1);
+
+        prune_traffic_captures(&root);
+
+        assert!(!root.join("session-vacia").exists());
+        assert!(root.join("session-viva").exists());
+    }
+
+    #[test]
+    fn pruning_a_missing_directory_is_not_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        prune_traffic_captures(&temp.path().join("no-existe"));
+    }
+
+    #[test]
+    fn capture_is_off_unless_the_environment_asks_for_it() {
+        let mut env = std::collections::HashMap::new();
+        assert!(!traffic_capture_enabled_for_env(&env));
+        env.insert("CCP_TRAFFIC_LOG".to_string(), "0".to_string());
+        assert!(!traffic_capture_enabled_for_env(&env));
+        env.insert("CCP_TRAFFIC_LOG".to_string(), "1".to_string());
+        assert!(traffic_capture_enabled_for_env(&env));
+    }
 }
