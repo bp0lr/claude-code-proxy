@@ -61,6 +61,9 @@ pub struct MonitorUiConfig<'a> {
     pub registry: &'a Registry,
     pub shutdown: Option<oneshot::Sender<()>>,
     pub shutdown_complete: Option<mpsc::Receiver<()>>,
+    /// Feed of the Grok plan window, refreshed off-thread. The monitor shows
+    /// whatever arrived last and never blocks waiting for it.
+    pub plan_usage: Option<mpsc::Receiver<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +89,7 @@ pub fn run_mock_monitor(port: u16, registry: &Registry) -> Result<(), anyhow::Er
             registry,
             shutdown: None,
             shutdown_complete: None,
+            plan_usage: None,
         },
         Some(mock_setup_text(port, registry)),
     )
@@ -112,6 +116,8 @@ fn run_monitor_loop(
         phase: MonitorPhase::Running,
         shutdown: config.shutdown,
         shutdown_complete: config.shutdown_complete,
+        plan_usage_feed: config.plan_usage,
+        plan_usage: None,
     };
 
     let run_result = run_monitor_events(&mut terminal, &mut snapshot, &mut app);
@@ -135,6 +141,7 @@ fn run_monitor_events(
     loop {
         let state = snapshot();
         app.clamp_selection(state.sessions.len(), state.recent.len());
+        app.drain_plan_usage();
         app.tick = app.tick.wrapping_add(1);
         terminal.draw(|frame| render(frame, app, &state))?;
         if app.shutdown_is_complete() {
@@ -242,9 +249,23 @@ struct MonitorApp {
     phase: MonitorPhase,
     shutdown: Option<oneshot::Sender<()>>,
     shutdown_complete: Option<mpsc::Receiver<()>>,
+    plan_usage_feed: Option<mpsc::Receiver<String>>,
+    plan_usage: Option<String>,
 }
 
 impl MonitorApp {
+    /// Takes whatever the refresher has posted since the last frame, keeping
+    /// only the newest. Never blocks: an empty channel just leaves the last
+    /// known value on screen.
+    fn drain_plan_usage(&mut self) {
+        let Some(feed) = self.plan_usage_feed.as_ref() else {
+            return;
+        };
+        while let Ok(usage) = feed.try_recv() {
+            self.plan_usage = Some(usage);
+        }
+    }
+
     fn handle_ctrl_c(&mut self) -> bool {
         if self.phase == MonitorPhase::ShuttingDown {
             true
@@ -427,7 +448,7 @@ fn render_header(
         .started_at
         .elapsed()
         .unwrap_or_else(|_| Duration::from_secs(0));
-    let text = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " claude-code-proxy",
             Style::default()
@@ -461,7 +482,20 @@ fn render_header(
                 .bg(TEAL)
                 .add_modifier(Modifier::BOLD),
         ),
-    ]);
+    ];
+    // Absent until the first lookup answers, so a missing or failed one costs
+    // the header nothing.
+    if let Some(plan) = app.plan_usage.as_deref() {
+        spans.push(Span::styled("  grok ", Style::default().fg(BG).bg(TEAL)));
+        spans.push(Span::styled(
+            plan.to_string(),
+            Style::default()
+                .fg(BG)
+                .bg(TEAL)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let text = Line::from(spans);
     frame.render_widget(Paragraph::new(text).style(Style::default().bg(TEAL)), area);
 }
 
@@ -2327,6 +2361,8 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: None,
             shutdown_complete: None,
+            plan_usage_feed: None,
+            plan_usage: None,
         };
 
         let buffer = draw(180, 48, |frame| render(frame, &mut app, &state));
@@ -2464,6 +2500,8 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: Some(shutdown_tx),
             shutdown_complete: Some(mpsc::channel().1),
+            plan_usage_feed: None,
+            plan_usage: None,
         };
 
         app.request_shutdown_confirmation();
@@ -2510,6 +2548,8 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: Some(shutdown_tx),
             shutdown_complete: Some(shutdown_complete_rx),
+            plan_usage_feed: None,
+            plan_usage: None,
         };
 
         assert!(!app.handle_ctrl_c());
@@ -2540,6 +2580,8 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: None,
             shutdown_complete: Some(complete_rx),
+            plan_usage_feed: None,
+            plan_usage: None,
         };
 
         assert!(!app.shutdown_is_complete());
@@ -2568,6 +2610,8 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: None,
             shutdown_complete: Some(mpsc::channel().1),
+            plan_usage_feed: None,
+            plan_usage: None,
         };
         let state = MonitorHandle::default().snapshot();
 
@@ -2576,6 +2620,73 @@ mod tests {
         });
 
         assert!(buffer_text(&header).contains("http://[::]:18765"));
+    }
+
+    fn header_with_plan(plan: Option<&str>) -> String {
+        let mut app = MonitorApp {
+            listen_url: "http://127.0.0.1:18765".to_string(),
+            setup_text: String::new(),
+            show_setup: false,
+            show_help: false,
+            detail: None,
+            focus: FocusPane::Sessions,
+            selected: 0,
+            recent_selected: 0,
+            tick: 0,
+            phase: MonitorPhase::Running,
+            shutdown: None,
+            shutdown_complete: Some(mpsc::channel().1),
+            plan_usage_feed: None,
+            plan_usage: plan.map(str::to_string),
+        };
+        app.drain_plan_usage();
+        let state = MonitorHandle::default().snapshot();
+        buffer_text(&draw(120, 1, |frame| {
+            render_header(frame, frame.area(), &app, &state)
+        }))
+    }
+
+    #[test]
+    fn header_shows_the_grok_plan_window_once_it_is_known() {
+        assert!(header_with_plan(Some("18% · 5d 17h")).contains("grok 18% · 5d 17h"));
+    }
+
+    #[test]
+    fn header_omits_the_plan_window_while_it_is_unknown() {
+        assert!(!header_with_plan(None).contains("grok"));
+    }
+
+    #[test]
+    fn the_newest_posted_plan_window_wins() {
+        let (sender, receiver) = mpsc::channel();
+        let mut app = MonitorApp {
+            listen_url: String::new(),
+            setup_text: String::new(),
+            show_setup: false,
+            show_help: false,
+            detail: None,
+            focus: FocusPane::Sessions,
+            selected: 0,
+            recent_selected: 0,
+            tick: 0,
+            phase: MonitorPhase::Running,
+            shutdown: None,
+            shutdown_complete: None,
+            plan_usage_feed: Some(receiver),
+            plan_usage: None,
+        };
+
+        app.drain_plan_usage();
+        assert_eq!(app.plan_usage, None);
+
+        sender.send("18%".to_string()).unwrap();
+        sender.send("19%".to_string()).unwrap();
+        app.drain_plan_usage();
+        assert_eq!(app.plan_usage.as_deref(), Some("19%"));
+
+        // A quiet channel leaves the last known value on screen.
+        app.drain_plan_usage();
+        assert_eq!(app.plan_usage.as_deref(), Some("19%"));
     }
 
     #[test]
@@ -2593,6 +2704,8 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: None,
             shutdown_complete: Some(mpsc::channel().1),
+            plan_usage_feed: None,
+            plan_usage: None,
         };
 
         app.clamp_selection(3, 4);
@@ -2619,6 +2732,8 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: None,
             shutdown_complete: Some(mpsc::channel().1),
+            plan_usage_feed: None,
+            plan_usage: None,
         };
 
         app.move_down(2, 3, true);
@@ -2645,6 +2760,8 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: None,
             shutdown_complete: Some(mpsc::channel().1),
+            plan_usage_feed: None,
+            plan_usage: None,
         };
 
         app.move_down(2, 3, false);

@@ -97,6 +97,9 @@ struct GrokConfig {
     pub client_version: Option<String>,
     /// Model used when a request does not name one.
     pub model: Option<String>,
+    /// Print the plan window on the launch banner. Defaults to on.
+    #[serde(rename = "usageOnStart")]
+    pub usage_on_start: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -318,6 +321,17 @@ pub fn grok_model() -> String {
         return model;
     }
     "grok-4.5".to_string()
+}
+
+pub fn grok_usage_on_start() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_GROK_USAGE_ON_START") {
+        return !matches!(raw.trim(), "0" | "false" | "no");
+    }
+    read_file_config(&paths::config_dir())
+        .and_then(|f| f.grok)
+        .and_then(|grok| grok.usage_on_start)
+        .unwrap_or(true)
 }
 
 pub fn grok_client_version() -> String {

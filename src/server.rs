@@ -16,7 +16,7 @@ use axum::{
     body::Body,
     extract::{Query, State},
     http::{Request, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use http_body_util::{BodyExt, StreamBody};
@@ -124,6 +124,7 @@ pub fn app_with_options(
     });
     let router = Router::new()
         .route("/healthz", get(healthz))
+        .route("/usage", get(handler_usage))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .route("/v1/models", get(handler_models));
@@ -149,6 +150,35 @@ async fn healthz() -> Json<serde_json::Value> {
 #[derive(serde::Deserialize)]
 struct ModelsQuery {
     limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct UsageQuery {
+    format: Option<String>,
+}
+
+/// How much of the Grok plan window the account has consumed.
+///
+/// This reports the account's standing with xAI, not what the proxy has served:
+/// the token counters live in the monitor, and the two answer different
+/// questions. Reaching upstream on every call is deliberate — a cached
+/// percentage is worse than none when the point is knowing whether there is
+/// room left to work.
+async fn handler_usage(Query(query): Query<UsageQuery>) -> Response {
+    let usage = match crate::providers::grok::billing::fetch_account_usage().await {
+        Ok(usage) => usage,
+        Err(error) => {
+            return json_error(StatusCode::BAD_GATEWAY, "api_error", error.to_string());
+        }
+    };
+    if query.format.as_deref() == Some("text") {
+        return (
+            [(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            format!("{}\n", usage.summary()),
+        )
+            .into_response();
+    }
+    Json(usage.to_json()).into_response()
 }
 
 /// Anthropic-shaped model listing so Claude Code's gateway model discovery

@@ -56,6 +56,8 @@ impl Generation {
 pub trait Backend {
     fn generate(&self, args: &Value) -> Result<Generation, String>;
     fn status(&self) -> String;
+    /// How much of the Grok plan window the account has burned through.
+    fn usage(&self) -> Result<String, String>;
 }
 
 pub struct HttpBackend {
@@ -75,6 +77,10 @@ impl HttpBackend {
 
     fn messages_url(&self) -> String {
         format!("http://127.0.0.1:{}/v1/messages", self.port)
+    }
+
+    fn usage_url(&self) -> String {
+        format!("http://127.0.0.1:{}/usage?format=text", self.port)
     }
 
     fn unreachable(&self, reason: &str) -> String {
@@ -104,7 +110,7 @@ fn build_request_body(args: &Value, default_model: &str) -> Result<Value, String
         .and_then(Value::as_str)
         .unwrap_or(default_model);
     assert_allowed_model(model).map_err(|_| {
-        format!("Modelo no soportado: {model}. Opciones: grok-4.5, grok-composer-2.5-fast")
+        format!("Modelo no soportado: {model}. Opciones: grok-4.6, grok-4.5, grok-composer-2.5-fast")
     })?;
 
     let max_tokens = match args.get("max_tokens") {
@@ -233,6 +239,24 @@ impl Backend for HttpBackend {
             Err(error) => self.unreachable(&error.to_string()),
         }
     }
+
+    fn usage(&self) -> Result<String, String> {
+        let response = self
+            .client
+            .get(self.usage_url())
+            .timeout(Duration::from_secs(30))
+            .send()
+            .map_err(|error| self.unreachable(&error.to_string()))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .map_err(|error| format!("No se pudo leer la respuesta del proxy: {error}"))?;
+        if !status.is_success() {
+            let payload: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            return Err(error_message(&payload, status.as_u16(), &body));
+        }
+        Ok(body.trim_end().to_string())
+    }
 }
 
 fn tool_definitions() -> Value {
@@ -256,8 +280,8 @@ fn tool_definitions() -> Value {
                     },
                     "model": {
                         "type": "string",
-                        "enum": ["grok-4.5", "grok-composer-2.5-fast"],
-                        "description": "Modelo. Default: grok-4.5."
+                        "enum": ["grok-4.6", "grok-4.5", "grok-composer-2.5-fast"],
+                        "description": "Modelo. Default: grok-4.5. grok-4.6 es el mas nuevo."
                     },
                     "max_tokens": {
                         "type": "integer",
@@ -280,6 +304,14 @@ fn tool_definitions() -> Value {
             "name": "status",
             "description": "Verifica que el proxy este levantado y responda. Usar cuando \
                 generate falla, para distinguir proxy caido de error de autenticacion.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+            "name": "usage",
+            "description": "Cuanto lleva consumido la cuenta de Grok en su ventana de plan \
+                (semanal), y cuando renueva. Es el limite que corta la generacion, no el \
+                conteo de tokens de una llamada. Usar antes de un trabajo largo, o cuando \
+                generate empieza a fallar por limite.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }
     ])
@@ -335,6 +367,13 @@ pub fn dispatch(request: &Value, backend: &dyn Backend) -> Option<Value> {
 
             match name {
                 "status" => Some(result(id, tool_text(backend.status(), false))),
+                "usage" => Some(result(
+                    id,
+                    match backend.usage() {
+                        Ok(summary) => tool_text(summary, false),
+                        Err(message) => tool_text(message, true),
+                    },
+                )),
                 // Tool failures are reported as results with isError, not as
                 // JSON-RPC errors, so the model can see and react to them.
                 "generate" => Some(result(
@@ -402,6 +441,9 @@ mod tests {
         fn status(&self) -> String {
             "mock".into()
         }
+        fn usage(&self) -> Result<String, String> {
+            Ok("Grok · ventana semanal: 18% consumido".into())
+        }
     }
 
     fn call(name: &str, args: Value) -> Value {
@@ -427,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_generate_and_status() {
+    fn tools_list_exposes_generate_status_and_usage() {
         let request = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let response = dispatch(&request, &MockBackend).unwrap();
         let names: Vec<_> = response["result"]["tools"]
@@ -436,7 +478,19 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, vec!["generate", "status"]);
+        assert_eq!(names, vec!["generate", "status", "usage"]);
+    }
+
+    #[test]
+    fn usage_reports_the_plan_window() {
+        let response = call("usage", json!({}));
+        assert_eq!(response["result"]["isError"], false);
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("ventana semanal")
+        );
     }
 
     #[test]
