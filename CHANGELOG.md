@@ -16,6 +16,25 @@ description: Release notes for claude-code-proxy.
   Images are omitted by default, with opt-in vision through
   `CCP_GROK_TOOL_IMAGE`. Traffic captures redact image payloads.
 
+- Grok accepts `grok-4.6`, and `CCP_GROK_MODEL` / `grok.model` selects the model
+  used when a request does not name one.
+- Grok account plan usage is available through `claude-code-proxy grok usage`,
+  `GET /usage`, the MCP `usage` tool, the monitor header, and the launch banner.
+  `CCP_GROK_USAGE_ON_START` or `grok.usageOnStart` turns the banner off.
+- Traffic captures and error captures keep only their newest 200 entries, so
+  leaving `CCP_TRAFFIC_LOG=1` on no longer grows the state directory without
+  bound. A capture that is still being written is never evicted.
+- Grok reasoning effort `none` is accepted on `/v1/chat/completions` and
+  `/v1/responses`, matching the Anthropic surface and the documented levels.
+- OpenAI Responses envelopes echo the request's `parallel_tool_calls` instead of
+  always reporting `false`, and a `parallel_tool_calls` sent without any tools no
+  longer synthesizes a `tool_choice` for providers that reject that shape.
+- Kimi receives `tool_choice` values of `none` and `required` as strings. They
+  were serialized as `null`, which dropped the caller's policy.
+- The MCP server's tool descriptions and errors, and every Grok plan-usage
+  string on the CLI, HTTP, and monitor surfaces, are in English like the rest of
+  the project.
+
 ## v0.1.25 (2026-07-24)
 
 - Kimi users can select Kimi K3 with the `kimi-k3` or `k3` model name, including

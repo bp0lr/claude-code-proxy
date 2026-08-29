@@ -57,6 +57,8 @@ A Homebrew service also writes `service.log` under the state root.
 
 Error payloads are safer to share than raw traffic captures, but inspect their prompt-derived content and paths before publishing them.
 
+The newest 200 error files are kept; older ones are deleted as new failures land.
+
 ## Traffic captures
 
 Set `CCP_TRAFFIC_LOG=1` to create captures under `traffic/` in the state root. Requests are grouped by Claude Code session and request sequence. A request directory can include:
@@ -69,6 +71,8 @@ Set `CCP_TRAFFIC_LOG=1` to create captures under `traffic/` in the state root. R
 - transport or reducer error details
 
 Event filenames use monotonic sequence numbers so lexical order preserves emission order.
+
+The newest 200 request directories are kept, oldest first by modification time, so leaving capture on is not an unbounded disk leak. The cap counts directories, not bytes: a capture of a very large conversation is bounded by the per-artifact size limits instead. A request still streaming is never evicted.
 
 <div class="security-callout">
 <strong>Traffic captures preserve content.</strong> Header and token redaction does not remove prompts, source code, tool definitions, tool inputs, tool results, images, or provider output. Treat the entire directory as sensitive user data.

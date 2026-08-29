@@ -74,6 +74,16 @@ A missing credential makes `auth status` exit with status 1. Other provider comm
 
 Logout removes the local proxy-owned credential. It does not call the provider to revoke a refresh token.
 
+## `grok usage`
+
+```sh
+claude-code-proxy grok usage [--json]
+```
+
+Prints how much of the Grok plan window the account has consumed and when the window renews. This is the account limit that stops generation, not the per-request token counts the monitor shows. `--json` prints the raw document instead of the summary. The command needs a Grok login and exits with status 2 when the lookup fails.
+
+The same figure is available over HTTP at [`GET /usage`](/reference/http-api/#get-usage), on the monitor header, and through the MCP `usage` tool. The launch banner prints it once at startup unless `CCP_GROK_USAGE_ON_START` or `grok.usageOnStart` turns that off.
+
 ## Development commands
 
 From a source checkout:
