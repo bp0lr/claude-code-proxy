@@ -462,8 +462,45 @@ fn render_header(
                 .add_modifier(Modifier::BOLD),
         ),
     ];
+    // Version sits right-aligned on the same bar: rendering it as a second
+    // widget over the right-hand slice keeps it pinned there regardless of how
+    // wide the left-hand counters grow.
     let text = Line::from(spans);
     frame.render_widget(Paragraph::new(text).style(Style::default().bg(TEAL)), area);
+
+    let version = build_version();
+    let width = version.chars().count() as u16 + 1;
+    if area.width > width {
+        let right = Rect {
+            x: area.x + area.width - width,
+            y: area.y,
+            width,
+            height: area.height,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{version} "),
+                Style::default()
+                    .fg(BG)
+                    .bg(TEAL)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .style(Style::default().bg(TEAL)),
+            right,
+        );
+    }
+}
+
+/// Crate version plus the commit it was built from, so a running monitor can
+/// be matched against a specific build rather than a release number that only
+/// moves when someone cuts one.
+fn build_version() -> String {
+    let sha = env!("CCP_GIT_SHA");
+    if sha == "unknown" {
+        format!("v{}", env!("CARGO_PKG_VERSION"))
+    } else {
+        format!("v{} {sha}", env!("CARGO_PKG_VERSION"))
+    }
 }
 
 fn panel(title: &'static str, focused: bool) -> Block<'static> {
@@ -2576,6 +2613,47 @@ mod tests {
         });
 
         assert!(buffer_text(&header).contains("http://[::]:18765"));
+    }
+
+    #[test]
+    fn the_header_carries_the_build_revision_on_the_right() {
+        let app = MonitorApp {
+            listen_url: "http://127.0.0.1:18765".to_string(),
+            setup_text: String::new(),
+            show_setup: false,
+            show_help: false,
+            detail: None,
+            focus: FocusPane::Sessions,
+            selected: 0,
+            recent_selected: 0,
+            tick: 0,
+            phase: MonitorPhase::Running,
+            shutdown: None,
+            shutdown_complete: Some(mpsc::channel().1),
+        };
+        let state = MonitorHandle::default().snapshot();
+        let header = buffer_text(&draw(120, 1, |frame| {
+            render_header(frame, frame.area(), &app, &state)
+        }));
+
+        let version = build_version();
+        assert!(header.contains(&version), "{header}");
+        // Right-aligned: nothing but padding after it.
+        let tail = header.split(&version).nth(1).unwrap_or_default();
+        assert!(
+            tail.trim().is_empty(),
+            "expected only padding after the version: {tail:?}"
+        );
+    }
+
+    /// A stamp that silently fell back to `unknown` would defeat the point.
+    #[test]
+    fn the_revision_is_stamped_at_build_time() {
+        assert_ne!(
+            env!("CCP_GIT_SHA"),
+            "unknown",
+            "build.rs did not capture the git revision"
+        );
     }
 
     #[test]
