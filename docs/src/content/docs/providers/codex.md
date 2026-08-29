@@ -26,7 +26,15 @@ Append `-fast` to any registered Codex model to request `service_tier: "priority
 
 ## Reasoning
 
-Claude Code's `/effort` value maps to Codex `reasoning.effort`: `low`, `medium`, `high`, `xhigh`, or `max`. A proxy override can also force `none`.
+Claude Code's `/effort` value maps to Codex `reasoning.effort`: `low`, `medium`, `high`, `xhigh`, or `max`.
+
+### Effort precedence
+
+A request that names its own effort keeps it. `CCP_CODEX_EFFORT` or `codex.effort` is the **default** applied to requests that name none, and it additionally accepts `none`.
+
+This ordering is what lets one session drive several models at different efforts — one agent on `gpt-5.6-sol` at medium alongside another on `gpt-5.6-luna` at high. A configured effort that replaced the requested one would collapse both to the same value.
+
+The configured value is validated at startup of the request path whether or not it ends up being used, so a typo is reported rather than lying dormant until some request happens to omit its effort.
 
 When reasoning is enabled, the proxy requests an automatic reasoning summary and translates summary deltas into Claude Code thinking blocks. Codex may omit a summary for a simple prompt. `CCP_CODEX_REASONING_SUMMARY=off` suppresses summaries while preserving effort and encrypted continuation content.
 
@@ -106,7 +114,7 @@ While the native request is active, the monitor shows `compacting`. Structured l
 
 `CCP_CODEX_RESPONSES_API=1` enables both `POST /v1/responses` and `POST /v1/chat/completions`. The setting is under Codex configuration, but the routes also accept Kimi, Grok, OpenCode Go, and Cursor models.
 
-The Responses route preserves native JSON or SSE response bodies for registered Codex models. The Chat Completions route translates standard text messages, reasoning effort, JSON object or JSON Schema output, and buffered or streaming responses. Its omitted reasoning effort defaults to `medium`; the proxy-wide Codex effort override still takes precedence.
+The Responses route preserves native JSON or SSE response bodies for registered Codex models. The Chat Completions route translates standard text messages, reasoning effort, JSON object or JSON Schema output, and buffered or streaming responses. When the request omits `reasoning_effort`, the proxy-wide Codex effort applies, and `medium` when that is unset too. A request that names an effort keeps it.
 
 The proxy replaces incoming credentials with stored Codex auth for both routes. Response retrieval or deletion, function calling through Chat Completions, and WebSocket ingress are outside their scope. See [HTTP API](/reference/http-api/) for supported Chat Completions fields and error behavior.
 

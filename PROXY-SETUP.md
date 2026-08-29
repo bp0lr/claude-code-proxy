@@ -373,7 +373,33 @@ It is a warning, not an error — the session works. Silence it by setting
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the model's real window, or by accepting the
 conservative 200k default.
 
-### 5.4 Switching
+### 5.4 Reasoning effort
+
+Effort travels per request — Claude Code's `/effort`, or whatever the harness
+sets for a given agent — and **the request wins**.
+
+`CCP_CODEX_EFFORT` / `codex.effort` is the *default* for requests that name no
+effort, not a replacement for ones that do. That ordering is what allows one
+session to drive several models at different efforts: one agent on
+`gpt-5.6-sol` at medium alongside another on `gpt-5.6-luna` at high. A
+configured effort that overrode the request would collapse both to one value.
+
+Levels per provider:
+
+| Provider | Accepted | Notes |
+| --- | --- | --- |
+| Codex | `low`, `medium`, `high`, `xhigh`, `max` | plus `none` from the configured default |
+| Grok | `none`, `low`, `medium`, `high`, `xhigh`, `max` | `xhigh` at full strength only on `grok-4.6`; `xhigh`/`max` map to `high` elsewhere |
+| Kimi | `low`, `medium`, `high` | K3 also takes `max` |
+| OpenCode Go | varies by model | `glm-5.x` rejects `low`/`medium`; `mimo` rejects `xhigh`/`max`; other models discard it |
+| Cursor | — | no effort field; the catalog carries effort variants in the model ID instead |
+
+One exception, and it is deliberate: `CCP_COMPACT_EFFORT` (default `low`) caps
+effort on Claude Code's summary-compaction requests, which run extraction over a
+whole transcript. It is a ceiling, never a raise, and applies only to those
+requests. `off` disables it.
+
+### 5.5 Switching
 
 A **model** switch stays in the same session — `/model`, `--model`, or a new
 `ANTHROPIC_MODEL`. Because routing is per request, this can also switch
@@ -436,6 +462,9 @@ not move the state root.
   "log": { "stderr": false, "verbose": false }
 }
 ```
+
+`codex.effort` there is a **default**, not an override: a request that names its
+own effort keeps it. See [§5.4](#54-reasoning-effort).
 
 All keys optional. A malformed file is ignored wholesale in favour of
 environment values and defaults — it does not fail loudly, so verify with
