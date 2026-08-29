@@ -362,9 +362,16 @@ fn now_ms() -> u64 {
 // Error mapping
 // ---------------------------------------------------------------------------
 
+// 403 is not 401. A credential the provider accepted but whose account lacks
+// the entitlement sends the caller to re-authenticate, which cannot fix it.
+// Codex, Grok and OpenCode already separate the two; these did not.
 fn cursor_provider_error(err: client::CursorError) -> ProviderError {
     let (status, kind) = match err.status {
-        401 | 403 => (StatusCode::UNAUTHORIZED, ProviderErrorKind::Authentication),
+        401 => (StatusCode::UNAUTHORIZED, ProviderErrorKind::Authentication),
+        402 | 403 => (
+            StatusCode::from_u16(err.status).unwrap_or(StatusCode::FORBIDDEN),
+            ProviderErrorKind::Permission,
+        ),
         429 => (StatusCode::TOO_MANY_REQUESTS, ProviderErrorKind::RateLimit),
         _ => (StatusCode::BAD_GATEWAY, ProviderErrorKind::Api),
     };
@@ -386,10 +393,17 @@ fn cursor_decode_provider_error(err: CursorDecodeError) -> ProviderError {
 
 fn map_cursor_error_to_response(err: &client::CursorError) -> Response {
     match err.status {
-        401 | 403 => json_error(
+        401 => json_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             err.detail.as_deref().unwrap_or("Authentication failed"),
+        ),
+        402 | 403 => json_error(
+            StatusCode::from_u16(err.status).unwrap_or(StatusCode::FORBIDDEN),
+            "permission_error",
+            err.detail
+                .as_deref()
+                .unwrap_or("The account is not permitted to use this model"),
         ),
         429 => {
             let retry_after = err.retry_after.as_deref().unwrap_or("5");
@@ -463,8 +477,7 @@ impl CliHandlers for CursorCli {
                     println!("Email: {email}");
                 }
                 if let Some(expires) = auth.expires {
-                    let remaining = expires.saturating_sub(now_ms()) / 1000;
-                    println!("Access token expires in: {remaining}s");
+                    println!("{}", crate::auth::format_expiry(expires, now_ms()));
                 } else {
                     println!("Access token expiry: unknown");
                 }
@@ -490,6 +503,20 @@ pub(crate) static CURSOR_CLI: CursorCli = CursorCli;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_errors_are_not_reported_as_authentication_failures() {
+        for status in [402, 403] {
+            let mapped = cursor_provider_error(client::CursorError {
+                status,
+                message: "denied".into(),
+                detail: None,
+                retry_after: None,
+            });
+            assert_eq!(mapped.status.as_u16(), status);
+            assert_eq!(mapped.kind, ProviderErrorKind::Permission);
+        }
+    }
 
     #[test]
     fn supported_models_includes_legacy_and_agent() {

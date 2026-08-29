@@ -286,9 +286,16 @@ fn count_sse_events(bytes: &[u8]) -> u64 {
     String::from_utf8_lossy(bytes).matches("event:").count() as u64
 }
 
+// 403 is not 401. A credential the provider accepted but whose account lacks
+// the entitlement sends the caller to re-authenticate, which cannot fix it.
+// Codex, Grok and OpenCode already separate the two; these did not.
 fn kimi_provider_error(err: client::KimiError) -> ProviderError {
     let (status, kind) = match err.status {
-        401 | 403 => (StatusCode::UNAUTHORIZED, ProviderErrorKind::Authentication),
+        401 => (StatusCode::UNAUTHORIZED, ProviderErrorKind::Authentication),
+        402 | 403 => (
+            StatusCode::from_u16(err.status).unwrap_or(StatusCode::FORBIDDEN),
+            ProviderErrorKind::Permission,
+        ),
         429 => (StatusCode::TOO_MANY_REQUESTS, ProviderErrorKind::RateLimit),
         _ => (StatusCode::BAD_GATEWAY, ProviderErrorKind::Api),
     };
@@ -301,10 +308,17 @@ fn kimi_provider_error(err: client::KimiError) -> ProviderError {
 
 fn map_kimi_error_to_response(err: &client::KimiError) -> Response {
     match err.status {
-        401 | 403 => json_error(
+        401 => json_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             err.detail.as_deref().unwrap_or("Authentication failed"),
+        ),
+        402 | 403 => json_error(
+            StatusCode::from_u16(err.status).unwrap_or(StatusCode::FORBIDDEN),
+            "permission_error",
+            err.detail
+                .as_deref()
+                .unwrap_or("The account is not permitted to use this model"),
         ),
         429 => {
             let retry_after = err.retry_after.as_deref().unwrap_or("5");
@@ -354,16 +368,25 @@ impl CliHandlers for KimiCli {
         let stored = store.load_auth()?;
         match stored {
             Some(auth) => {
+                let now = now_ms();
+                let expired = crate::auth::is_expired(auth.expires, now);
                 println!("Auth path: {}", store.auth_path());
-                println!("Authenticated: true");
+                println!(
+                    "Authenticated: {}",
+                    if expired { "expired" } else { "true" }
+                );
                 if let Some(ref uid) = auth.user_id {
                     println!("User: {uid}");
                 }
                 if let Some(ref scope) = auth.scope {
                     println!("Scope: {scope}");
                 }
-                let remaining = auth.expires.saturating_sub(now_ms()) / 1000;
-                println!("Expires in {remaining}s");
+                println!("{}", crate::auth::format_expiry(auth.expires, now));
+                if expired {
+                    println!(
+                        "The stored token has expired. A request will refresh it; if that fails, run: claude-code-proxy kimi auth login"
+                    );
+                }
                 Ok(())
             }
             None => {
@@ -381,3 +404,33 @@ impl CliHandlers for KimiCli {
 }
 
 pub(crate) static KIMI_CLI: KimiCli = KimiCli;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn error(status: u16) -> client::KimiError {
+        client::KimiError {
+            status,
+            message: "denied".into(),
+            detail: None,
+            retry_after: None,
+        }
+    }
+
+    #[test]
+    fn permission_errors_are_not_reported_as_authentication_failures() {
+        for status in [402, 403] {
+            let mapped = kimi_provider_error(error(status));
+            assert_eq!(mapped.status.as_u16(), status);
+            assert_eq!(mapped.kind, ProviderErrorKind::Permission);
+        }
+    }
+
+    #[test]
+    fn a_missing_or_rejected_credential_is_still_an_authentication_failure() {
+        let mapped = kimi_provider_error(error(401));
+        assert_eq!(mapped.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(mapped.kind, ProviderErrorKind::Authentication);
+    }
+}

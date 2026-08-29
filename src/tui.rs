@@ -1662,14 +1662,13 @@ fn mock_setup_text(port: u16, registry: &Registry) -> String {
 }
 
 pub fn setup_text(port: u16, registry: &Registry) -> String {
-    let grouped = registry.grouped_models();
-    let model_summary = ["codex", "kimi", "cursor"]
-        .into_iter()
-        .filter_map(|provider| {
-            grouped
-                .get(provider)
-                .map(|models| format!("{provider}: {} models", models.len()))
-        })
+    // Every registered provider, not a hardcoded subset: the list used to name
+    // three of them, so a proxy serving only Grok showed a panel Grok was
+    // absent from.
+    let model_summary = registry
+        .grouped_models()
+        .iter()
+        .map(|(provider, models)| format!("{provider}: {} models", models.len()))
         .collect::<Vec<_>>()
         .join("  ");
     let mut lines = vec![

@@ -99,8 +99,8 @@ fn codex_auth_status_no_account_id_shows_none() -> Result<(), Box<dyn std::error
 }
 
 #[test]
-fn codex_auth_status_expired_auth_shows_negative_seconds() -> Result<(), Box<dyn std::error::Error>>
-{
+fn codex_auth_status_names_an_expired_credential_as_expired()
+-> Result<(), Box<dyn std::error::Error>> {
     let (mut cmd, temp) = codex_cmd();
     let auth_dir = temp.path().join("codex");
     std::fs::create_dir_all(&auth_dir)?;
@@ -114,7 +114,7 @@ fn codex_auth_status_expired_auth_shows_negative_seconds() -> Result<(), Box<dyn
     assert_eq!(lines.len(), 3, "{out}");
     assert!(lines[0].starts_with("Account:"));
     assert!(
-        lines[1].starts_with("Expires: 2000-01-01T00:00:00.000Z (in -"),
+        lines[1].starts_with("Expires: 2000-01-01T00:00:00.000Z (EXPIRED "),
         "{out}"
     );
     assert!(lines[2].starts_with("Storage: "), "{out}");

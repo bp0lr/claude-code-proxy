@@ -456,6 +456,38 @@ where
     InMemoryAuthStore::new()
 }
 
+/// One-line credential expiry, shared by every provider's `auth status`.
+///
+/// Each provider used to format this itself, and three of the four clamped the
+/// remaining time at zero, so a credential that expired hours ago printed
+/// `Expires in 0s` next to `Authenticated: true`. An expired token is now named
+/// as expired.
+pub fn format_expiry(expires_ms: u64, now_ms: u64) -> String {
+    let remaining = (i128::from(expires_ms) - i128::from(now_ms)).div_euclid(1000);
+    let iso = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires_ms) * 1_000_000)
+        .ok()
+        .and_then(|dt| {
+            let fmt = time::format_description::parse_borrowed::<2>(
+                "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
+            )
+            .ok()?;
+            dt.format(&fmt).ok()
+        })
+        .unwrap_or_else(|| "invalid".to_string());
+    if remaining < 0 {
+        format!("Expires: {iso} (EXPIRED {}s ago)", -remaining)
+    } else {
+        format!("Expires: {iso} (in {remaining}s)")
+    }
+}
+
+/// Whether a stored credential is still usable on its face. Says nothing about
+/// the account behind it: a provider can accept the token and still refuse the
+/// request.
+pub fn is_expired(expires_ms: u64, now_ms: u64) -> bool {
+    expires_ms <= now_ms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

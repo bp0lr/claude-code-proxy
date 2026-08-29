@@ -610,12 +610,19 @@ impl CliHandlers for GrokCli {
         let store = file_store();
         match store.load_auth()? {
             Some(auth) => {
+                let now = now_ms();
+                let expired = crate::auth::is_expired(auth.expires_at_ms, now);
                 println!("Auth path: {}", store.auth_path());
-                println!("Authenticated: true");
                 println!(
-                    "Expires in {}s",
-                    auth.expires_at_ms.saturating_sub(now_ms()) / 1000
+                    "Authenticated: {}",
+                    if expired { "expired" } else { "true" }
                 );
+                println!("{}", crate::auth::format_expiry(auth.expires_at_ms, now));
+                if expired {
+                    println!(
+                        "The stored token has expired. A request will refresh it; if that fails, run: claude-code-proxy grok auth login"
+                    );
+                }
                 Ok(())
             }
             None => anyhow::bail!("Not authenticated"),

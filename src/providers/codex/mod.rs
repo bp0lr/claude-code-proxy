@@ -1562,20 +1562,7 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn format_expiry(expires: u64, now: u64) -> String {
-    let remaining = (i128::from(expires) - i128::from(now)).div_euclid(1000);
-    let iso = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires) * 1_000_000)
-        .ok()
-        .and_then(|dt| {
-            let fmt = time::format_description::parse_borrowed::<2>(
-                "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
-            )
-            .ok()?;
-            dt.format(&fmt).ok()
-        })
-        .unwrap_or_else(|| "invalid".to_string());
-    format!("Expires: {iso} (in {remaining}s)")
-}
+use crate::auth::format_expiry;
 
 fn format_auth_saved_output(auth_path: &str, account_id: Option<&str>) -> String {
     let mut out = format!("Auth saved in {auth_path}\n");
@@ -2033,7 +2020,8 @@ mod tests {
         let expires = 946684800000;
         let now = 946684810000; // 10s after
         let output = format_expiry(expires, now);
-        assert!(output.starts_with("Expires: 2000-01-01T00:00:00.000Z (in -"));
+        assert!(output.starts_with("Expires: 2000-01-01T00:00:00.000Z (EXPIRED "));
+        assert!(output.ends_with("s ago)"));
     }
 
     #[tokio::test]
