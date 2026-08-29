@@ -1,43 +1,44 @@
 <#
 .SYNOPSIS
-    Manda un prompt a Grok a traves del proxy local y devuelve el texto.
+    Send one prompt to Grok through the local proxy and return the text.
 
 .DESCRIPTION
-    Habla con la API Anthropic-compatible que expone claude-code-proxy en
-    127.0.0.1:18765. Requiere que el proxy este corriendo:
+    Talks to the Anthropic-compatible API that claude-code-proxy exposes on
+    127.0.0.1:18765. The proxy has to be running:
         claude-code-proxy serve --no-monitor
+    or just double-click start-proxy.cmd next to this file.
 
 .EXAMPLE
-    .\grok.ps1 "Escribi una escena de dos paginas entre Marta y el inspector."
+    .\grok-prompt.ps1 "Write a two-page scene between Marta and the inspector."
 
 .EXAMPLE
-    .\grok.ps1 -File .\escaleta.md -System "Sos guionista de novela rioplatense." -Out .\cap03.md
+    .\grok-prompt.ps1 -File .\outline.md -System "You write literary fiction." -Out .\ch03.md
 
 .EXAMPLE
-    "Dame tres finales alternativos" | .\grok.ps1 -Model grok-composer-2.5-fast
+    "Give me three alternative endings" | .\grok-prompt.ps1 -Model grok-composer-2.5-fast
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0, ValueFromPipeline = $true)]
     [string]$Prompt,
 
-    # Lee el prompt desde un archivo en lugar del argumento.
+    # Read the prompt from a file instead of the argument.
     [string]$File,
 
-    # System prompt. Define voz, formato y restricciones.
+    # System prompt. Sets voice, format and constraints.
     [string]$System,
 
-    [ValidateSet('grok-4.5', 'grok-composer-2.5-fast')]
+    [ValidateSet('grok-4.6', 'grok-4.5', 'grok-composer-2.5-fast')]
     [string]$Model = 'grok-4.5',
 
     [ValidateRange(1, 200000)]
     [int]$MaxTokens = 16384,
 
-    # 0 = deterministico, 1 = maxima variacion. Omitir usa el default del modelo.
+    # 0 is deterministic, 1 is maximum variation. Omit to use the model default.
     [ValidateRange(0.0, 2.0)]
     [Nullable[double]]$Temperature,
 
-    # Guarda la respuesta en un archivo (UTF-8) ademas de imprimirla.
+    # Also write the answer to a file, as UTF-8.
     [string]$Out,
 
     [int]$Port = 18765
@@ -47,13 +48,13 @@ $ErrorActionPreference = 'Stop'
 
 if ($File) {
     if (-not (Test-Path -LiteralPath $File)) {
-        throw "No existe el archivo: $File"
+        throw "No such file: $File"
     }
     $Prompt = Get-Content -LiteralPath $File -Raw -Encoding UTF8
 }
 
 if ([string]::IsNullOrWhiteSpace($Prompt)) {
-    throw 'Falta el prompt. Pasalo como argumento, por -File, o por pipeline.'
+    throw 'No prompt. Pass it as an argument, through -File, or on the pipeline.'
 }
 
 $body = [ordered]@{
@@ -71,8 +72,8 @@ $body = [ordered]@{
 if ($System) { $body.system = $System }
 if ($null -ne $Temperature) { $body.temperature = $Temperature }
 
-# UTF-8 explicito en los dos sentidos: los acentos y la enie se rompen si se
-# deja que PowerShell elija la codificacion.
+# UTF-8 explicitly in both directions: accented characters break if PowerShell
+# is left to pick the encoding on its own.
 $json = $body | ConvertTo-Json -Depth 20 -Compress
 $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
 $uri = "http://127.0.0.1:$Port/v1/messages"
@@ -84,10 +85,10 @@ try {
         -TimeoutSec 600 -UseBasicParsing
 }
 catch {
-    # En PowerShell 7 el cuerpo de una respuesta de error llega por
-    # ErrorDetails; .Exception.Response es un HttpResponseMessage y no tiene
-    # GetResponseStream(). Sin esto, un 502 del proxy se confundia con "el
-    # proxy no esta levantado", que es un diagnostico completamente distinto.
+    # In PowerShell 7 an error response body arrives through ErrorDetails;
+    # .Exception.Response is an HttpResponseMessage and has no
+    # GetResponseStream(). Without this, a 502 from the proxy looked like "the
+    # proxy is not running", which is a completely different diagnosis.
     $detail = $_.ErrorDetails.Message
     $status = $null
     if ($_.Exception.PSObject.Properties.Name -contains 'Response' -and $_.Exception.Response) {
@@ -95,21 +96,21 @@ catch {
     }
 
     if ($detail) {
-        $mensaje = $null
-        try { $mensaje = ($detail | ConvertFrom-Json).error.message } catch { }
-        if (-not $mensaje) { $mensaje = $detail }
-        throw "El proxy respondio HTTP $status : $mensaje"
+        $message = $null
+        try { $message = ($detail | ConvertFrom-Json).error.message } catch { }
+        if (-not $message) { $message = $detail }
+        throw "The proxy answered HTTP $status : $message"
     }
 
     if ($status) {
-        throw "El proxy respondio HTTP $status sin cuerpo."
+        throw "The proxy answered HTTP $status with no body."
     }
 
-    throw "No se pudo conectar a $uri ($($_.Exception.Message)). Levanta el proxy con: claude-code-proxy serve --no-monitor"
+    throw "Could not reach $uri ($($_.Exception.Message)). Start the proxy with: claude-code-proxy serve --no-monitor"
 }
 
-# Se decodifica desde el stream crudo: PowerShell 7 entrega .Content ya como
-# texto y 5.1 a veces como byte[], asi que no se puede asumir ninguno de los dos.
+# Decoded from the raw stream: PowerShell 7 hands back .Content already as
+# text and 5.1 sometimes as byte[], so neither can be assumed.
 $raw = if ($response.RawContentStream) {
     [System.Text.Encoding]::UTF8.GetString($response.RawContentStream.ToArray())
 }
@@ -127,7 +128,7 @@ $text = ($payload.content |
     ForEach-Object { $_.text }) -join ''
 
 if ([string]::IsNullOrEmpty($text)) {
-    Write-Warning "Grok no devolvio texto (stop_reason: $($payload.stop_reason))."
+    Write-Warning "Grok returned no text (stop_reason: $($payload.stop_reason))."
 }
 
 if ($Out) {
@@ -136,10 +137,10 @@ if ($Out) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
     Set-Content -LiteralPath $Out -Value $text -Encoding UTF8
-    Write-Verbose "Guardado en $Out"
+    Write-Verbose "Written to $Out"
 }
 
-Write-Verbose ("tokens: entrada={0} salida={1} stop={2}" -f `
+Write-Verbose ("tokens: input={0} output={1} stop={2}" -f `
         $payload.usage.input_tokens, $payload.usage.output_tokens, $payload.stop_reason)
 
 $text
