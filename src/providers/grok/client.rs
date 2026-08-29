@@ -73,6 +73,13 @@ impl GrokClient {
                 // many minutes and a total timeout would cut it mid-text. This
                 // fires only if the upstream goes quiet for two minutes.
                 .read_timeout(Duration::from_secs(120))
+                // Matches the official Grok client's transport tuning so long
+                // idle gaps mid-stream don't get silently dropped by an
+                // intermediary before the read timeout would even notice.
+                .tcp_nodelay(true)
+                .http2_keep_alive_interval(Duration::from_secs(15))
+                .http2_keep_alive_timeout(Duration::from_secs(5))
+                .http2_keep_alive_while_idle(true)
                 .build()?,
         );
         let auth = Arc::new(GrokAuthManager::new(file_store())?);

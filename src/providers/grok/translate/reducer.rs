@@ -60,7 +60,7 @@ impl Reducer {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("event lacks type"))?;
         match typ {
-            "response.created" | "response.in_progress" => Ok(vec![]),
+            "response.created" | "response.in_progress" | "response.doom_loop_check" => Ok(vec![]),
             "response.reasoning_summary_part.added"
             | "response.reasoning_summary_part.done"
             | "response.content_part.added" => Ok(vec![]),
@@ -471,6 +471,21 @@ mod tests {
             ),
             "the partial text must survive: {events:?}"
         );
+    }
+
+    /// xAI's abuse-detection heartbeat, unrelated to the response content.
+    /// Treated like `response.created`/`response.in_progress`: acknowledged
+    /// and dropped, never surfaced as an unknown event.
+    #[test]
+    fn grok_reducer_ignores_doom_loop_check() {
+        let input = b"data: {\"type\":\"response.doom_loop_check\",\"doom_loop_check\":{\"triggers\":[]}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n";
+        let events = reduce_upstream_bytes(input).unwrap();
+        assert!(
+            events.iter().any(
+                |event| matches!(event, ReducerEvent::TextDelta(_, delta) if delta == "partial")
+            )
+        );
+        assert!(matches!(events.last(), Some(ReducerEvent::Finish { .. })));
     }
 
     #[test]
