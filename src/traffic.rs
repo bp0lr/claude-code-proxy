@@ -17,8 +17,9 @@ pub struct TrafficCapture {
 
 /// Request directories kept under `traffic/`. Enough to debug a session's
 /// worth of failures, bounded enough that leaving capture on is not a slow
-/// disk leak.
-pub const MAX_TRAFFIC_CAPTURES: usize = 200;
+/// disk leak. This bounds the directory *count*; a single capture is itself
+/// bounded by the byte limits below rather than by this.
+const MAX_TRAFFIC_CAPTURES: usize = 200;
 pub const MAX_SSE_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_STREAM_CAPTURE_EVENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_STREAM_CAPTURE_EVENTS: usize = 1_024;
@@ -62,6 +63,7 @@ pub fn create_traffic_capture(opts: TrafficCaptureOptions) -> Option<TrafficCapt
             sanitize_path_part(opts.provider.as_deref().unwrap_or("unknown-provider")),
             sanitize_path_part(&opts.req_id),
         ));
+    register_live_capture(&state_root);
     prune_traffic_captures(&traffic_root);
 
     Some(TrafficCapture {
@@ -69,6 +71,38 @@ pub fn create_traffic_capture(opts: TrafficCaptureOptions) -> Option<TrafficCapt
         artifact_counter: Mutex::new(0),
         event_counter: Mutex::new(0),
     })
+}
+
+/// Capture roots with a request still writing to them.
+///
+/// A capture's directory only appears on the first write and its mtime then
+/// stays frozen until the next one. A streaming generation can run for
+/// minutes between those writes, so by mtime it looks like the oldest capture
+/// on disk and gets evicted out from under itself — losing exactly the
+/// artifact capture was turned on to collect. Registration is what keeps the
+/// eviction scan away from it.
+fn live_captures() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    static LIVE: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn register_live_capture(root: &Path) {
+    if let Ok(mut live) = live_captures().lock() {
+        live.insert(root.to_path_buf());
+    }
+}
+
+fn release_live_capture(root: &Path) {
+    if let Ok(mut live) = live_captures().lock() {
+        live.remove(root);
+    }
+}
+
+impl Drop for TrafficCapture {
+    fn drop(&mut self) {
+        release_live_capture(&self.root);
+    }
 }
 
 /// Capture is a debugging switch that is easy to leave on, and every request
@@ -81,16 +115,21 @@ fn prune_traffic_captures(traffic_root: &Path) {
     };
     let sessions: Vec<PathBuf> = sessions
         .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
         .collect();
 
+    let live = live_captures()
+        .lock()
+        .map(|live| live.clone())
+        .unwrap_or_default();
     let mut captures: Vec<(std::time::SystemTime, PathBuf)> = sessions
         .iter()
         .filter_map(|session| fs::read_dir(session).ok())
         .flat_map(|entries| entries.flatten())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
+        .filter(|path| !live.contains(path))
         .filter_map(|path| {
             let modified = path.metadata().and_then(|meta| meta.modified()).ok()?;
             Some((modified, path))
@@ -570,13 +609,33 @@ mod tests {
     fn a_session_left_without_captures_is_removed() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("traffic");
-        create_dir_all(root.join("session-vacia")).unwrap();
-        capture_dir(&root, "session-viva", 1);
+        create_dir_all(root.join("session-empty")).unwrap();
+        capture_dir(&root, "session-live", 1);
 
         prune_traffic_captures(&root);
 
-        assert!(!root.join("session-vacia").exists());
-        assert!(root.join("session-viva").exists());
+        assert!(!root.join("session-empty").exists());
+        assert!(root.join("session-live").exists());
+    }
+
+    /// A streaming capture writes its metadata and then nothing until the
+    /// stream ends, so by mtime it is the oldest directory on disk while it is
+    /// still the one being written.
+    #[test]
+    fn pruning_spares_a_capture_that_is_still_being_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("traffic");
+        let in_flight = root.join("session-a").join("000000-grok-req");
+        capture_dir(&root, "session-a", 0);
+        register_live_capture(&in_flight);
+        for index in 1..MAX_TRAFFIC_CAPTURES + 10 {
+            capture_dir(&root, "session-a", index);
+        }
+
+        prune_traffic_captures(&root);
+
+        assert!(in_flight.exists(), "the live capture was evicted");
+        release_live_capture(&in_flight);
     }
 
     #[test]
