@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod billing;
 pub mod client;
 pub mod count_tokens;
 pub mod translate;
@@ -143,12 +144,22 @@ impl Provider for GrokProvider {
                     }
                     (StatusCode::OK, Json(value)).into_response()
                 }
-                Err(_) => {
-                    write_error(ctx.traffic.as_deref(), "accumulate", "invalid_response");
+                // The cause is the whole diagnostic: which event the reducer
+                // choked on, or how the stream was malformed. Collapsing it to
+                // a fixed string leaves a 502 with nothing to act on.
+                Err(error) => {
+                    let detail = error.to_string();
+                    write_error_detail(
+                        ctx.traffic.as_deref(),
+                        "accumulate",
+                        "invalid_response",
+                        Some(&detail),
+                    );
+                    log_upstream_failure(&ctx.req_id, "accumulate", "invalid_response", &detail);
                     json_error(
                         StatusCode::BAD_GATEWAY,
                         "api_error",
-                        "Grok response is invalid",
+                        format!("Grok response is invalid: {detail}"),
                     )
                 }
             }
@@ -299,7 +310,13 @@ where
             }
             let events = match self.decoder.push(&chunk) {
                 Ok(events) => events,
-                Err(_) => return Some(self.fail_at("decoder", "malformed_sse")),
+                Err(error) => {
+                    return Some(self.fail_with(
+                        "decoder",
+                        "malformed_sse",
+                        Some(error.to_string()),
+                    ));
+                }
             };
             let mut out = Vec::new();
             for event in events {
@@ -317,7 +334,13 @@ where
                 }
                 let reduced = match self.reducer.push(value) {
                     Ok(events) => events,
-                    Err(_) => return Some(self.fail_at("reducer", "invalid_event")),
+                    Err(error) => {
+                        return Some(self.fail_with(
+                            "reducer",
+                            "invalid_event",
+                            Some(error.to_string()),
+                        ));
+                    }
                 };
                 let usage = reduced.iter().find_map(|event| match event {
                     translate::reducer::ReducerEvent::Finish {
@@ -329,7 +352,13 @@ where
                 });
                 match self.translator.render(reduced) {
                     Ok(bytes) => out.extend(bytes),
-                    Err(_) => return Some(self.fail_at("render", "invalid_event")),
+                    Err(error) => {
+                        return Some(self.fail_with(
+                            "render",
+                            "invalid_event",
+                            Some(error.to_string()),
+                        ));
+                    }
                 }
                 if let Some((input_tokens, output_tokens)) = usage
                     && let Some(monitor) = self.monitor.as_ref()
@@ -351,13 +380,21 @@ where
     }
 
     fn fail_at(&mut self, stage: &str, kind: &str) -> Vec<u8> {
+        self.fail_with(stage, kind, None)
+    }
+
+    /// `detail` carries the underlying error. It is logged rather than streamed
+    /// so the SSE error frame keeps the shape clients already parse.
+    fn fail_with(&mut self, stage: &str, kind: &str, detail: Option<String>) -> Vec<u8> {
         self.error_sent = true;
+        let detail = detail.unwrap_or_else(|| kind.to_string());
+        log_upstream_failure(&self.req_id, stage, kind, &detail);
         if let Some(capture) = self.stream_capture.as_mut() {
             capture.malformed(stage, kind);
             capture.downstream_event("error", serde_json::json!({"type":"error","error":{"type":"api_error","message":"Grok stream is invalid"}}));
         }
         if let Some(traffic) = self.traffic.as_ref() {
-            traffic.write_json("060-grok-stream-error", &serde_json::json!({"stage":stage,"kind":kind,"bytes":self.bytes,"chunks":self.chunks}));
+            traffic.write_json("060-grok-stream-error", &serde_json::json!({"stage":stage,"kind":kind,"detail":detail,"bytes":self.bytes,"chunks":self.chunks}));
         }
         self.finish_capture(false);
         stream_error()
@@ -425,12 +462,36 @@ impl<S> Drop for GrokStreamState<S> {
 }
 
 fn write_error(traffic: Option<&crate::traffic::TrafficCapture>, stage: &str, kind: &str) {
+    write_error_detail(traffic, stage, kind, None);
+}
+
+fn write_error_detail(
+    traffic: Option<&crate::traffic::TrafficCapture>,
+    stage: &str,
+    kind: &str,
+    detail: Option<&str>,
+) {
     if let Some(traffic) = traffic {
         traffic.write_json(
             "060-grok-stream-error",
-            &serde_json::json!({"stage":stage,"kind":kind}),
+            &serde_json::json!({"stage":stage,"kind":kind,"detail":detail}),
         );
     }
+}
+
+/// A failed upstream translation is the one thing worth a log line of its own:
+/// traffic capture is off by default, so without this the only trace left of a
+/// 502 is its status code.
+fn log_upstream_failure(req_id: &str, stage: &str, kind: &str, detail: &str) {
+    crate::logging::create_logger("grok").error(
+        "upstream_translation_failed",
+        Some(serde_json::Map::from_iter([
+            ("reqId".to_string(), serde_json::json!(req_id)),
+            ("stage".to_string(), serde_json::json!(stage)),
+            ("kind".to_string(), serde_json::json!(kind)),
+            ("detail".to_string(), serde_json::json!(detail)),
+        ])),
+    );
 }
 
 fn map_error(error: client::GrokError) -> Response {
