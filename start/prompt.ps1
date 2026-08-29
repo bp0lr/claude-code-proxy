@@ -1,21 +1,27 @@
 <#
 .SYNOPSIS
-    Send one prompt to Grok through the local proxy and return the text.
+    Send one prompt through the local proxy and return the text.
 
 .DESCRIPTION
     Talks to the Anthropic-compatible API that claude-code-proxy exposes on
-    127.0.0.1:18765. The proxy has to be running:
+    127.0.0.1:18765. The model ID picks the provider, so any model the proxy
+    routes works here: Codex, Kimi, Grok, OpenCode Go or Cursor. The proxy has
+    to be running:
         claude-code-proxy serve --no-monitor
     or just double-click start-proxy.cmd next to this file.
 
 .EXAMPLE
-    .\grok-prompt.ps1 "Write a two-page scene between Marta and the inspector."
+    .\prompt.ps1 -Model grok-4.6 "Write a two-page scene between Marta and the inspector."
 
 .EXAMPLE
-    .\grok-prompt.ps1 -File .\outline.md -System "You write literary fiction." -Out .\ch03.md
+    .\prompt.ps1 -Model gpt-5.6-sol -File .\outline.md -Out .\ch03.md
 
 .EXAMPLE
-    "Give me three alternative endings" | .\grok-prompt.ps1 -Model grok-composer-2.5-fast
+    "Give me three alternative endings" | .\prompt.ps1 -Model kimi-k3
+
+.NOTES
+    -Model is required unless CCP_MCP_MODEL is set. Run 'claude-code-proxy
+    models' for the catalog; an unknown ID comes back with it too.
 #>
 [CmdletBinding()]
 param(
@@ -28,8 +34,10 @@ param(
     # System prompt. Sets voice, format and constraints.
     [string]$System,
 
-    [ValidateSet('grok-4.6', 'grok-4.5', 'grok-composer-2.5-fast')]
-    [string]$Model = 'grok-4.5',
+    # Any model ID the proxy routes; it also picks the provider. Not validated
+    # here on purpose: the registry is the proxy's, and Cursor's catalog is
+    # discovered at runtime, so a list baked in here would drift.
+    [string]$Model = $env:CCP_MCP_MODEL,
 
     [ValidateRange(1, 200000)]
     [int]$MaxTokens = 16384,
@@ -55,6 +63,10 @@ if ($File) {
 
 if ([string]::IsNullOrWhiteSpace($Prompt)) {
     throw 'No prompt. Pass it as an argument, through -File, or on the pipeline.'
+}
+
+if ([string]::IsNullOrWhiteSpace($Model)) {
+    throw "No model. Pass -Model, or set CCP_MCP_MODEL. Run 'claude-code-proxy models' for the catalog."
 }
 
 $body = [ordered]@{
@@ -128,7 +140,7 @@ $text = ($payload.content |
     ForEach-Object { $_.text }) -join ''
 
 if ([string]::IsNullOrEmpty($text)) {
-    Write-Warning "Grok returned no text (stop_reason: $($payload.stop_reason))."
+    Write-Warning "The model returned no text (stop_reason: $($payload.stop_reason))."
 }
 
 if ($Out) {
@@ -140,7 +152,8 @@ if ($Out) {
     Write-Verbose "Written to $Out"
 }
 
-Write-Verbose ("tokens: input={0} output={1} stop={2}" -f `
-        $payload.usage.input_tokens, $payload.usage.output_tokens, $payload.stop_reason)
+Write-Verbose ("model={0} input={1} output={2} stop={3}" -f `
+        $payload.model, $payload.usage.input_tokens, $payload.usage.output_tokens,
+        $payload.stop_reason)
 
 $text

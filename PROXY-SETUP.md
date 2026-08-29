@@ -43,12 +43,14 @@ has nothing to do with MCP.** Claude Code stops being Claude here: the respondin
 model is Grok/Codex/Kimi/Cursor/OpenCode.
 
 **Role 2 — MCP server (optional).** `claude-code-proxy mcp` runs a stdio MCP
-server that exposes Grok as a *tool*. Here the agent stays whatever it was and
-can additionally call out to Grok. This role is Grok-only and is an extra, not
-the point of the project.
+server that exposes the proxy's models as a *tool*. Here the agent stays
+whatever it was and can additionally ask a different model a question. It routes
+through the same proxy, so any provider is reachable.
 
-You can use either, both, or neither. If the goal is "run this project on
-Grok/Codex/Kimi", that is Role 1 and MCP never enters the picture.
+The two are opposites, not alternatives. Role 1 **replaces** the model that
+reasons; Role 2 **adds** a model the reasoning one can consult. If the goal is
+"run this project on Codex/Grok/Kimi", that is Role 1 and MCP never enters the
+picture.
 
 ### Security
 
@@ -453,34 +455,42 @@ Two worth knowing:
 
 ---
 
-## 8. MCP server (optional, Grok only)
+## 8. MCP server (optional)
 
-Independent of everything above. Exposes Grok as a **tool** to an agent that
-otherwise stays as it is.
+Independent of everything above. Exposes the proxy's models as a **tool** to an
+agent that otherwise stays as it is.
 
 ```sh
 claude-code-proxy mcp          # stdio, JSON-RPC 2.0, spawned by the client
 ```
 
-Tools: `generate` (text from Grok) and `status` (is the proxy up). It reaches
-Grok **through the running proxy**, so the proxy must be up for `generate`;
-`status` is what tells you whether it is.
+Tools: `generate` (text from any model the proxy routes) and `status` (is the
+proxy up). The `model` argument picks the provider exactly as it does on the
+HTTP routes, so one MCP entry covers all five. It answers **through the running
+proxy**, so the proxy must be up for `generate`; `status` is what tells you
+whether it is.
+
+`model` is required unless a default is configured through `CCP_MCP_MODEL` or
+`mcp.model`. There is deliberately no built-in default: with five providers,
+picking one here would be an arbitrary preference. An unknown ID comes back with
+the supported catalog, and the reply reports which model answered.
 
 Per-project registration — `.mcp.json` at the project root, committed:
 
 ```json
 {
   "mcpServers": {
-    "grok": {
+    "ccp": {
       "type": "stdio",
       "command": "claude-code-proxy",
-      "args": ["mcp"]
+      "args": ["mcp"],
+      "env": {"CCP_MCP_MODEL": "grok-4.6"}
     }
   }
 }
 ```
 
-Or by CLI: `claude mcp add --scope project grok -- claude-code-proxy mcp`
+Or by CLI: `claude mcp add --scope project ccp -e CCP_MCP_MODEL=grok-4.6 -- claude-code-proxy mcp`
 
 **Check that the binary is actually on `PATH` first** (`command -v
 claude-code-proxy`). A source checkout that was never installed globally is not,
@@ -490,7 +500,7 @@ problem. Use an absolute path in that case:
 ```json
 {
   "mcpServers": {
-    "grok": {
+    "ccp": {
       "type": "stdio",
       "command": "C:/path/to/claude-code-proxy/target/release/claude-code-proxy.exe",
       "args": ["mcp"]

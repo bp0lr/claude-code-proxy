@@ -1,8 +1,13 @@
-//! MCP server over stdio, exposing Grok as a tool for MCP clients.
+//! MCP server over stdio, exposing the proxy's models as a tool.
 //!
 //! Speaks JSON-RPC 2.0 on stdin/stdout and forwards generation requests to the
 //! proxy's own Anthropic-compatible endpoint, so every call shows up in the
 //! monitor and reuses the existing translation path.
+//!
+//! Model IDs are not validated here. The proxy routes every registered model
+//! to its provider and answers an unknown one with the supported catalog, so
+//! duplicating that list would only let the two drift apart — and Cursor's
+//! catalog is discovered at runtime, which a local copy could not know.
 //!
 //! Nothing but protocol frames may ever reach stdout.
 
@@ -10,8 +15,6 @@ use std::io::{BufRead, Write};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-
-use crate::providers::grok::translate::model_allowlist::assert_allowed_model;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const DEFAULT_MAX_TOKENS: u64 = 16384;
@@ -25,6 +28,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 #[derive(Debug)]
 pub struct Generation {
     pub text: String,
+    /// Which model actually answered. Worth reporting now that any of the
+    /// proxy's providers can be the one that did.
+    pub model: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub stop_reason: Option<String>,
@@ -37,7 +43,8 @@ impl Generation {
         match (self.input_tokens, self.output_tokens) {
             (None, None) => None,
             (input, output) => Some(format!(
-                "[usage] input={} output={} stop={}{}",
+                "[usage] model={} input={} output={} stop={}{}",
+                self.model.as_deref().unwrap_or("?"),
                 input.map_or_else(|| "?".into(), |value| value.to_string()),
                 output.map_or_else(|| "?".into(), |value| value.to_string()),
                 stop,
@@ -90,8 +97,10 @@ impl HttpBackend {
 /// fields with a 400, so only whitelisted keys are ever sent.
 ///
 /// `default_model` is passed in rather than read from config here, so the
-/// caller owns that lookup and tests stay deterministic.
-fn build_request_body(args: &Value, default_model: &str) -> Result<Value, String> {
+/// caller owns that lookup and tests stay deterministic. It is optional
+/// because there is no sensible provider-neutral fallback: with no configured
+/// default the caller has to name a model.
+fn build_request_body(args: &Value, default_model: Option<&str>) -> Result<Value, String> {
     let prompt = args
         .get("prompt")
         .and_then(Value::as_str)
@@ -99,16 +108,18 @@ fn build_request_body(args: &Value, default_model: &str) -> Result<Value, String
         .filter(|prompt| !prompt.is_empty())
         .ok_or("prompt is required and cannot be empty")?;
 
+    // An unknown ID is the proxy's call, not this layer's: it answers 400 with
+    // the supported catalog, which is surfaced verbatim.
     let model = args
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or(default_model);
-    assert_allowed_model(model).map_err(|_| {
-        format!(
-            "Unsupported model: {model}. Options: {}",
-            crate::registry::GROK_MODELS.join(", ")
-        )
-    })?;
+        .filter(|model| !model.is_empty())
+        .or(default_model)
+        .ok_or(
+            "model is required: no default is configured. Pass \"model\", or set \
+             CCP_MCP_MODEL (or mcp.model in config.json). Run \
+             'claude-code-proxy models' for the catalog.",
+        )?;
 
     let max_tokens = match args.get("max_tokens") {
         None | Some(Value::Null) => DEFAULT_MAX_TOKENS,
@@ -172,11 +183,15 @@ fn extract_generation(payload: &Value) -> Result<Generation, String> {
 
     if text.is_empty() {
         let stop = stop_reason.as_deref().unwrap_or("unknown");
-        return Err(format!("Grok returned no text (stop_reason: {stop})"));
+        return Err(format!("The model returned no text (stop_reason: {stop})"));
     }
 
     Ok(Generation {
         text,
+        model: payload
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         input_tokens: payload
             .pointer("/usage/input_tokens")
             .and_then(Value::as_u64),
@@ -197,7 +212,8 @@ fn error_message(payload: &Value, status: u16, raw: &str) -> String {
 
 impl Backend for HttpBackend {
     fn generate(&self, args: &Value) -> Result<Generation, String> {
-        let body = build_request_body(args, &crate::config::grok_model())?;
+        let default = crate::config::mcp_model();
+        let body = build_request_body(args, default.as_deref())?;
         let response = self
             .client
             .post(self.messages_url())
@@ -242,9 +258,10 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "generate",
-            "description": "Generate text with Grok through the local proxy. Meant for \
-                long-form writing (scenes, dialogue, outlines) where you want Grok's voice \
-                instead of your own. Returns the raw text.",
+            "description": "Generate text through the local proxy, using any model it \
+                routes: Codex, Kimi, Grok, OpenCode Go or Cursor. Meant for asking a \
+                different model than the one running this session - a second opinion, \
+                or long-form writing in another voice. Returns the raw text.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -259,8 +276,10 @@ fn tool_definitions() -> Value {
                     },
                     "model": {
                         "type": "string",
-                        "enum": crate::registry::GROK_MODELS,
-                        "description": "Model. Defaults to grok-4.5; grok-4.6 is the newest."
+                        "description": "Any model ID the proxy routes, which also picks \
+                            the provider. Required unless a default is configured. An \
+                            unknown ID comes back with the supported catalog; \
+                            'claude-code-proxy models' lists it too."
                     },
                     "max_tokens": {
                         "type": "integer",
@@ -282,7 +301,7 @@ fn tool_definitions() -> Value {
         {
             "name": "status",
             "description": "Check that the proxy is up and answering. Use it when generate \
-                fails, to tell a stopped proxy apart from an authentication error.",
+                fails, to tell a stopped proxy apart from an upstream error.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }
     ])
@@ -322,7 +341,7 @@ pub fn dispatch(request: &Value, backend: &dyn Backend) -> Option<Value> {
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "grok", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "claude-code-proxy", "version": env!("CARGO_PKG_VERSION")},
             }),
         )),
         "ping" => Some(result(id?, json!({}))),
@@ -391,8 +410,9 @@ mod tests {
 
     impl Backend for MockBackend {
         fn generate(&self, args: &Value) -> Result<Generation, String> {
-            build_request_body(args, "grok-4.5").map(|body| Generation {
+            build_request_body(args, Some("gpt-5.6-sol")).map(|body| Generation {
                 text: body.to_string(),
+                model: Some("gpt-5.6-sol".into()),
                 input_tokens: Some(248),
                 output_tokens: Some(825),
                 stop_reason: Some("end_turn".into()),
@@ -472,7 +492,7 @@ mod tests {
                 "temperature": 0.7,
                 "max_tokens": 900,
             }),
-            "grok-4.5",
+            Some("grok-4.5"),
         )
         .unwrap();
 
@@ -501,40 +521,63 @@ mod tests {
 
     #[test]
     fn configured_default_applies_but_an_explicit_model_wins() {
-        let body =
-            build_request_body(&json!({"prompt": "hello"}), "grok-composer-2.5-fast").unwrap();
+        let body = build_request_body(&json!({"prompt": "hello"}), Some("grok-composer-2.5-fast"))
+            .unwrap();
         assert_eq!(body["model"], "grok-composer-2.5-fast");
 
-        let body = build_request_body(&json!({"prompt": "hello", "model": "grok-4.5"}), "grok-4.5")
-            .unwrap();
-        assert_eq!(body["model"], "grok-4.5");
+        // The explicit model may belong to a different provider than the
+        // default: this layer forwards the ID and the proxy does the routing.
+        let body = build_request_body(
+            &json!({"prompt": "hello", "model": "kimi-k3"}),
+            Some("grok-4.5"),
+        )
+        .unwrap();
+        assert_eq!(body["model"], "kimi-k3");
+    }
+
+    #[test]
+    fn a_model_is_required_when_nothing_is_configured() {
+        let error = build_request_body(&json!({"prompt": "hello"}), None)
+            .expect_err("must ask for a model");
+        assert!(error.contains("model is required"), "{error}");
+        assert!(error.contains("CCP_MCP_MODEL"), "{error}");
+
+        // An empty string is not a model either.
+        assert!(build_request_body(&json!({"prompt": "hello", "model": ""}), None).is_err());
+    }
+
+    /// Every provider's IDs reach the proxy untouched. Validating them here
+    /// would duplicate the registry and drift from it.
+    #[test]
+    fn forwards_model_ids_from_every_provider() {
+        for model in [
+            "gpt-5.6-sol",
+            "kimi-k3",
+            "grok-4.6",
+            "opencode-go/qwen3.8-max",
+            "cursor:composer-2.5",
+            "sonnet",
+        ] {
+            let body = build_request_body(&json!({"prompt": "hello", "model": model}), None)
+                .unwrap_or_else(|error| panic!("{model} rejected: {error}"));
+            assert_eq!(body["model"], model);
+        }
     }
 
     #[test]
     fn request_body_omits_absent_optionals() {
-        let body = build_request_body(&json!({"prompt": "hello"}), "grok-4.5").unwrap();
+        let body = build_request_body(&json!({"prompt": "hello"}), Some("grok-4.5")).unwrap();
         assert!(body.get("system").is_none());
         assert!(body.get("temperature").is_none());
         assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
     }
 
     #[test]
-    fn rejects_models_outside_the_grok_allowlist() {
-        let error = build_request_body(
-            &json!({"prompt": "hello", "model": "gpt-5.6-sol"}),
-            "grok-4.5",
-        )
-        .expect_err("must reject");
-        assert!(error.contains("Unsupported model"));
-    }
-
-    #[test]
     fn rejects_out_of_range_numbers() {
-        assert!(build_request_body(&json!({"prompt": "a", "temperature": 9}), "grok-4.5").is_err());
-        assert!(build_request_body(&json!({"prompt": "a", "max_tokens": 0}), "grok-4.5").is_err());
-        assert!(
-            build_request_body(&json!({"prompt": "a", "max_tokens": "many"}), "grok-4.5").is_err()
-        );
+        let model = Some("grok-4.5");
+        assert!(build_request_body(&json!({"prompt": "a", "temperature": 9}), model).is_err());
+        assert!(build_request_body(&json!({"prompt": "a", "max_tokens": 0}), model).is_err());
+        assert!(build_request_body(&json!({"prompt": "a", "max_tokens": "many"}), model).is_err());
     }
 
     #[test]
@@ -546,6 +589,7 @@ mod tests {
         // The text block must stay free of accounting noise.
         assert!(!content[0]["text"].as_str().unwrap().contains("[usage]"));
         let usage = content[1]["text"].as_str().unwrap();
+        assert!(usage.contains("model=gpt-5.6-sol"), "{usage}");
         assert!(usage.contains("input=248"), "{usage}");
         assert!(usage.contains("output=825"), "{usage}");
         assert_eq!(response["result"]["isError"], false);
@@ -555,6 +599,7 @@ mod tests {
     fn a_truncated_generation_says_so_in_the_usage_line() {
         let generation = Generation {
             text: "half a scene".into(),
+            model: Some("grok-4.6".into()),
             input_tokens: Some(10),
             output_tokens: Some(4096),
             stop_reason: Some("max_tokens".into()),
@@ -567,6 +612,7 @@ mod tests {
     fn usage_block_is_omitted_when_the_proxy_reports_nothing() {
         let generation = Generation {
             text: "text".into(),
+            model: None,
             input_tokens: None,
             output_tokens: None,
             stop_reason: None,

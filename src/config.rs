@@ -45,6 +45,13 @@ struct FileConfig {
     pub cursor: Option<CursorConfig>,
     pub grok: Option<GrokConfig>,
     pub opencode: Option<OpenCodeConfig>,
+    pub mcp: Option<McpConfig>,
+}
+
+#[derive(Deserialize, Clone)]
+struct McpConfig {
+    /// Model the MCP `generate` tool uses when the call does not name one.
+    pub model: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -400,6 +407,27 @@ pub fn grok_model() -> String {
         return model;
     }
     "grok-4.5".to_string()
+}
+
+/// Default model for the MCP `generate` tool. `CCP_MCP_MODEL` wins over
+/// `mcp.model` in config.json.
+///
+/// Deliberately has no built-in fallback: the proxy serves five providers and
+/// picking one of them here would be an arbitrary preference baked into a
+/// provider-neutral surface. With nothing configured, the tool asks the caller
+/// to name a model.
+pub fn mcp_model() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_MCP_MODEL") {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            return Some(raw.to_string());
+        }
+    }
+    read_file_config(&paths::config_dir())
+        .and_then(|f| f.mcp)
+        .and_then(|mcp| mcp.model)
+        .filter(|model| !model.trim().is_empty())
 }
 
 pub fn grok_client_version() -> String {

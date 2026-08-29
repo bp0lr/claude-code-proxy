@@ -69,6 +69,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 | `CCP_LOG_STDERR` | `log.stderr` | `false` | Mirrors logs to stderr when present in the environment, regardless of its value. |
 | `CCP_LOG_VERBOSE` | `log.verbose` | `false` | Preserves full string fields in structured logs when present, regardless of its value. |
 | `CCP_TRAFFIC_LOG` | none | `false` | Enables full request captures for `1`, `true`, or `yes`. |
+| `CCP_MCP_MODEL` | `mcp.model` | none | Default model for the MCP `generate` tool. With nothing set, the tool requires an explicit `model`. |
 | `XDG_STATE_HOME` | none | `~/.local/state` | State base on macOS and Linux. |
 
 `CCP_CONFIG_DIR` affects `config.json` and file-backed provider auth. It does not relocate the state directory.
