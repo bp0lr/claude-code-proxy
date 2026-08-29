@@ -353,6 +353,39 @@ async fn messages_response(app: axum::Router, model: &str) -> axum::response::Re
     .unwrap()
 }
 
+struct OkProvider;
+
+#[async_trait]
+impl Provider for OkProvider {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec!["gpt-5.5".to_string(), "gpt-5.6-luna".to_string()]
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::OK, "ok").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::OK, "counted").into_response()
+    }
+}
+
 // Claude Code populates the `requestId` field of every transcript record from
 // the `request-id` response header. Consumers that de-duplicate those records
 // by request id count each request twice without it, because a transcript
@@ -362,9 +395,7 @@ async fn successful_response_carries_a_request_id() {
     let registry = || {
         Arc::new(Registry::from_providers(
             AliasProvider::Codex,
-            [Arc::new(IdentityCaptureProvider {
-                captured: Arc::new(Mutex::new(Vec::new())),
-            }) as Arc<dyn Provider>],
+            [Arc::new(OkProvider) as Arc<dyn Provider>],
         ))
     };
     let first = messages_response(app(registry()), "gpt-5.5").await;
