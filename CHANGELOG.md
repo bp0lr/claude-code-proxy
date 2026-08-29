@@ -16,6 +16,10 @@ description: Release notes for claude-code-proxy.
   Images are omitted by default, with opt-in vision through
   `CCP_GROK_TOOL_IMAGE`. Traffic captures redact image payloads.
 
+- A reasoning effort named by the request is no longer replaced by
+  `CCP_CODEX_EFFORT` / `codex.effort`, which becomes the default for requests
+  that name none. Running several models at different efforts in one session
+  works again.
 - Grok accepts `grok-4.6`, and `CCP_GROK_MODEL` / `grok.model` selects the model
   used when a request does not name one.
 - Traffic captures and error captures keep only their newest 200 entries, so

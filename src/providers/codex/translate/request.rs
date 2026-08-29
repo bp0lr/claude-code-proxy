@@ -281,27 +281,36 @@ fn resolve_effort(effort: Option<Effort>) -> Result<Option<Effort>, anyhow::Erro
     resolve_effort_override(effort, config::codex_effort().as_deref())
 }
 
+/// Combines the effort the request asked for with the configured one.
+///
+/// The request wins. A harness that drives several models in one session -
+/// one agent on `gpt-5.6-sol` at medium, another on `gpt-5.6-luna` at high -
+/// has to be able to say so per request, and this used to discard every one of
+/// those in favour of a single configured value. The configured effort is the
+/// default for requests that name none.
+///
+/// The configured value is validated whether or not it ends up being used, so
+/// a typo is reported instead of sitting dormant until some request happens to
+/// omit its effort.
 pub(crate) fn resolve_effort_override(
     effort: Option<Effort>,
     override_effort: Option<&str>,
 ) -> Result<Option<Effort>, anyhow::Error> {
-    if let Some(val) = override_effort {
-        let valid = ["none", "low", "medium", "high", "xhigh", "max"];
-        if !valid.contains(&val) {
-            anyhow::bail!(
-                "Invalid effort override: \"{val}\". Must be one of: none, low, medium, high, xhigh, max"
-            );
-        }
-        return Ok(Some(match val {
+    let configured = match override_effort {
+        None => None,
+        Some(val) => Some(match val {
             "max" => Effort::Max,
             "xhigh" => Effort::Xhigh,
             "high" => Effort::High,
             "medium" => Effort::Medium,
             "low" => Effort::Low,
-            _ => Effort::None,
-        }));
-    }
-    Ok(effort)
+            "none" => Effort::None,
+            _ => anyhow::bail!(
+                "Invalid effort override: \"{val}\". Must be one of: none, low, medium, high, xhigh, max"
+            ),
+        }),
+    };
+    Ok(effort.or(configured))
 }
 
 fn reasoning_summary_requested(summary: Option<&str>) -> bool {
@@ -1592,9 +1601,31 @@ mod tests {
     }
 
     #[test]
-    fn translate_effort_override_max_maps_to_max() {
-        let effort = resolve_effort_override(Some(Effort::Low), Some("max")).unwrap();
+    fn the_configured_effort_applies_when_the_request_names_none() {
+        let effort = resolve_effort_override(None, Some("max")).unwrap();
         assert!(matches!(effort, Some(Effort::Max)));
+    }
+
+    /// The reported defect: two agents on different models, each asking for its
+    /// own effort, both ran at the configured one.
+    #[test]
+    fn a_requested_effort_survives_a_configured_one() {
+        for (requested, expected) in [
+            (Effort::Low, Effort::Low),
+            (Effort::Medium, Effort::Medium),
+            (Effort::High, Effort::High),
+            (Effort::Xhigh, Effort::Xhigh),
+            (Effort::Max, Effort::Max),
+        ] {
+            let resolved = resolve_effort_override(Some(requested.clone()), Some("high")).unwrap();
+            assert_eq!(resolved, Some(expected), "requested {requested:?}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_configured_effort_is_reported_even_when_unused() {
+        assert!(resolve_effort_override(Some(Effort::High), Some("turbo")).is_err());
+        assert!(resolve_effort_override(None, Some("turbo")).is_err());
     }
 
     #[test]

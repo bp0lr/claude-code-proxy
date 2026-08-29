@@ -92,8 +92,12 @@ fn translate_request_with_override(
         ));
     }
 
+    // An absent field stays absent here rather than becoming `medium`
+    // immediately: materialising the default this early would outrank the
+    // configured effort, which is meant to be exactly the value used when the
+    // request names none. The default is applied after that resolution.
     let request_effort = match object.get("reasoning_effort") {
-        None | Some(Value::Null) => Some(Effort::Medium),
+        None | Some(Value::Null) => None,
         Some(Value::String(value)) => parse_effort(value)?,
         Some(_) => {
             return Err(ChatError::invalid(
@@ -103,15 +107,17 @@ fn translate_request_with_override(
             ));
         }
     };
-    let effort = resolve_effort_override(request_effort, effort_override).map_err(|error| {
-        ChatError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
-            error.to_string(),
-            None,
-            None,
-        )
-    })?;
+    let effort = resolve_effort_override(request_effort, effort_override)
+        .map(|resolved| resolved.or(Some(Effort::Medium)))
+        .map_err(|error| {
+            ChatError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                error.to_string(),
+                None,
+                None,
+            )
+        })?;
 
     let mut text = Map::from_iter([("verbosity".to_string(), json!("low"))]);
     if let Some(format) = translate_response_format(object.get("response_format"))? {
@@ -509,15 +515,23 @@ mod tests {
     }
 
     #[test]
-    fn accepts_all_efforts_and_forced_override_wins() {
+    fn accepts_all_efforts_and_the_request_outranks_the_configured_one() {
         for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
             let mut body = base();
             body["reasoning_effort"] = json!(effort);
             assert!(translate_request_with_override(body, None).is_ok());
         }
+
+        // A request that names its effort keeps it, so two models can run at
+        // two different efforts under one configured value.
         let mut body = base();
         body["reasoning_effort"] = json!("low");
         let translated = translate_request_with_override(body, Some("high")).unwrap();
+        assert_eq!(translated.upstream["reasoning"]["effort"], "low");
+        assert_eq!(translated.effort.as_deref(), Some("low"));
+
+        // With no effort in the request, the configured one is the default.
+        let translated = translate_request_with_override(base(), Some("high")).unwrap();
         assert_eq!(translated.upstream["reasoning"]["effort"], "high");
         assert_eq!(translated.effort.as_deref(), Some("high"));
     }
